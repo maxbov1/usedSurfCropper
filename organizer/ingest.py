@@ -29,10 +29,11 @@ except ImportError:
     pass
 
 SUPPORTED = {".jpg", ".jpeg", ".png", ".heic"}
-PROCESSING_VERSION = "0.9.0-contiguous-card-sessions"
+PROCESSING_VERSION = "0.10.0-board-similarity-grouping"
 MAX_PHOTOS_PER_BOARD = 7
 STANDARD_BOARD_PHOTOS = 6
 SHOT_LIMITS = {"full_board": 4, "side_profile": 1, "fin_detail": 1, "card": 1}
+BOARD_SIMILARITY_BOUNDARY = 0.10
 
 
 def visual_signature(image: Image.Image) -> tuple[float, ...]:
@@ -72,6 +73,19 @@ def visual_distance(left: dict, right: dict) -> float:
         return 0.0
     a, b = np.asarray(first, dtype=np.float32), np.asarray(second, dtype=np.float32)
     return float(np.mean(np.abs(a - b)))
+
+
+def card_visual_affinity(card: dict, photos: list[dict]) -> float | None:
+    """Measure card similarity only after board-photo clusters are formed."""
+    distances = sorted(
+        visual_distance(card, photo)
+        for photo in photos
+        if photo.get("visual_signature")
+    )
+    if not distances:
+        return None
+    nearest = distances[: min(3, len(distances))]
+    return sum(nearest) / len(nearest)
 
 
 def sha256(path: Path) -> str:
@@ -441,7 +455,56 @@ def group_scanned(files: list[dict]) -> list[list[dict]]:
             current = []
     if current:
         groups.append(current)
-    return _enforce_shot_limits([group for group in groups if group])
+    visually_grouped = _split_by_board_similarity([group for group in groups if group])
+    return _enforce_shot_limits(visually_grouped)
+
+
+def _split_by_board_similarity(groups: list[list[dict]]) -> list[list[dict]]:
+    """Split mixed sessions by board appearance, then attach cards to a cluster.
+
+    Cards provide identity data, but the board photos determine membership.
+    Card frames are excluded from the boundary calculation because their
+    paper/background layout is intentionally different from board frames.
+    """
+    partitioned: list[list[dict]] = []
+    for group in groups:
+        photos = [item for item in group if not item.get("is_card")]
+        cards = [item for item in group if item.get("is_card")]
+        if len(cards) > 1 or len(photos) < 4:
+            partitioned.append(group)
+            continue
+        boundaries = [
+            index
+            for index in range(1, len(photos))
+            if index >= 2
+            and len(photos) - index >= 2
+            and visual_distance(photos[index - 1], photos[index]) >= BOARD_SIMILARITY_BOUNDARY
+        ]
+        if not boundaries:
+            partitioned.append(group)
+            continue
+        clusters: list[list[dict]] = []
+        start = 0
+        for boundary in boundaries:
+            clusters.append(photos[start:boundary])
+            start = boundary
+        clusters.append(photos[start:])
+        card = cards[0] if cards else None
+        if card:
+            first_photo_index = next(index for index, item in enumerate(group) if not item.get("is_card"))
+            last_photo_index = max(index for index, item in enumerate(group) if not item.get("is_card"))
+            card_index = group.index(card)
+            if card_index <= first_photo_index:
+                card_cluster = 0
+            elif card_index >= last_photo_index:
+                card_cluster = len(clusters) - 1
+            else:
+                before = card_visual_affinity(card, clusters[0])
+                after = card_visual_affinity(card, clusters[-1])
+                card_cluster = 0 if before is not None and (after is None or before <= after) else len(clusters) - 1
+            clusters[card_cluster].append(card)
+        partitioned.extend(cluster for cluster in clusters if cluster)
+    return partitioned
 
 
 def shot_bucket(item: dict) -> str | None:

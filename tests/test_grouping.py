@@ -64,21 +64,20 @@ class GroupingTests(unittest.TestCase):
         self.assertEqual(group_limit_violations(groups[0]), {})
         self.assertEqual(group_limit_violations(groups[1]), {})
 
-    def test_capture_session_stays_contiguous_across_visual_change(self):
+    def test_board_similarity_splits_mixed_visual_session(self):
         items = [
             {**photo("CARD.JPG", card=True), "shot_type": "card"},
             *[photo(f"BLUE_{index}.JPG", value=0.0) for index in range(3)],
             *[photo(f"WHITE_{index}.JPG", value=0.2) for index in range(3)],
         ]
         groups = group_scanned(items)
-        self.assertEqual([len(group) for group in groups], [7])
+        self.assertEqual([len(group) for group in groups], [4, 3])
         self.assertEqual(sum(item["is_card"] for item in groups[0]), 1)
 
     def test_card_stays_with_following_session_when_taken_first(self):
         items = [
             {**photo("CARD.JPG", card=True, value=0.0), "shot_type": "card"},
-            *[photo(f"BLUE_{index}.JPG", value=0.0) for index in range(3)],
-            *[photo(f"WHITE_{index}.JPG", value=0.2) for index in range(3)],
+            *[photo(f"BLUE_{index}.JPG", value=0.0) for index in range(6)],
         ]
         groups = group_scanned(items)
         self.assertEqual([len(group) for group in groups], [7])
