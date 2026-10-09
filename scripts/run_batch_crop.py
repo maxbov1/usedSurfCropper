@@ -14,7 +14,7 @@ CODE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE_ROOT))
 
 from organizer.config import runtime_root  # noqa: E402
-from organizer.crop import classify_shot, rotated_crop_proposal  # noqa: E402
+from organizer.crop import classify_shot, rotated_crop_proposal, shared_full_board_padding, suggested_crop  # noqa: E402
 from organizer.db import connect, record_artifact, set_run_worker, update_run  # noqa: E402
 from organizer.ingest import read_image  # noqa: E402
 from organizer.export import safe_name  # noqa: E402
@@ -46,6 +46,23 @@ def main() -> int:
     conn.close()
     report_path = run_root / "report.json"
     results = []
+    prepared = []
+    for photo in photos:
+        source = ROOT / photo["source_path"]
+        image, _ = read_image(source)
+        classification = classify_shot(image)
+        shot_type = str(classification.get("shot_type", "detail"))
+        # Populate the refined OpenCV boundary before calculating the group
+        # target. The proposal itself is regenerated below with that target.
+        suggested_crop(image, shot_type=shot_type, classification=classification)
+        prepared.append({"photo": photo, "source": source, "image": image, "classification": classification, "shot_type": shot_type})
+    padding_by_board = {}
+    for board_id in {str(item["photo"]["board_id"]) for item in prepared}:
+        cases = [
+            {"shot_type": item["shot_type"], "classification": item["classification"], "image_size": item["image"].size}
+            for item in prepared if str(item["photo"]["board_id"]) == board_id
+        ]
+        padding_by_board[board_id] = shared_full_board_padding(cases)
 
     def write_progress(complete: bool = False) -> None:
         payload = {"run_id": args.run_id, "complete": complete, "files": results}
@@ -61,12 +78,18 @@ def main() -> int:
         db.close()
 
     write_progress()
-    for photo in photos:
-        source = ROOT / photo["source_path"]
-        image, _ = read_image(source)
-        classification = classify_shot(image)
-        shot_type = str(classification.get("shot_type", "detail"))
-        proposal = rotated_crop_proposal(image, shot_type=shot_type, classification=classification)
+    for item in prepared:
+        photo, source, image = item["photo"], item["source"], item["image"]
+        classification, shot_type = item["classification"], item["shot_type"]
+        group_padding = padding_by_board[str(photo["board_id"])]
+        proposal = rotated_crop_proposal(
+            image,
+            shot_type=shot_type,
+            padding=float(group_padding["vertical"]),
+            rail_padding=float(group_padding["horizontal"]),
+            classification=classification,
+        )
+        classification["group_padding"] = group_padding
         working = proposal["image"]
         x, y, width, height = proposal["crop"]
         board = safe_name(photo["board_label"] or f"board-{photo['board_id']}")

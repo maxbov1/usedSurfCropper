@@ -668,6 +668,10 @@ def create_app(root: Path) -> Flask:
         for photo in photo_data:
             group_counts[str(photo["board_id"])] = group_counts.get(str(photo["board_id"]), 0) + 1
         oversized_groups = {group_id: count for group_id, count in group_counts.items() if count > MAX_PHOTOS_PER_BOARD}
+        identity_missing = bool(photo_data) and bool(boards) and all(
+            not any(board[name] for name in ("sku", "shaper", "model") if name in board.keys())
+            for board in boards
+        )
         ocr_status = {"runtime": {"available": False, "status": "not_run"}, "files_scanned": 0, "cards_detected": 0, "identifiers_extracted": 0}
         ocr_status_path = directories["data"] / "ocr-status.json"
         if ocr_status_path.exists():
@@ -675,7 +679,7 @@ def create_app(root: Path) -> Flask:
                 ocr_status.update(json.loads(ocr_status_path.read_text()))
             except (OSError, json.JSONDecodeError):
                 ocr_status["runtime"] = {"available": False, "status": "status_unreadable"}
-        return render_template("shuffleboard.html", boards=boards, photos=photo_data, predictions=predictions, retest=retest, retest_mode=retest_mode, retest_name=retest_path.name if retest_path else "", grouping_run_id=grouping_run_id, max_photos_per_board=MAX_PHOTOS_PER_BOARD, oversized_groups=oversized_groups, ocr_status=ocr_status)
+        return render_template("shuffleboard.html", boards=boards, photos=photo_data, predictions=predictions, retest=retest, retest_mode=retest_mode, retest_name=retest_path.name if retest_path else "", grouping_run_id=grouping_run_id, max_photos_per_board=MAX_PHOTOS_PER_BOARD, oversized_groups=oversized_groups, ocr_status=ocr_status, identity_missing=identity_missing)
 
     @app.post("/shuffleboard/save")
     def save_shuffleboard():

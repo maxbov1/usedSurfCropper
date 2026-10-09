@@ -185,7 +185,36 @@ def classify_shot(image: Image.Image, card: bool = False) -> dict[str, object]:
     return with_yolo({"shot_type": "detail", "confidence": 0.45, "review": True, "reason": "no complete board silhouette; preserve original framing"})
 
 
-def suggested_crop(image: Image.Image, shot_type: str = "full_board", padding: float = DEFAULT_CROP_PADDING, classification: dict[str, object] | None = None) -> tuple[int, int, int, int, str]:
+def shared_full_board_padding(cases: list[dict], desired_vertical: float = DEFAULT_VERTICAL_PADDING, desired_horizontal: float = DEFAULT_HORIZONTAL_PADDING) -> dict[str, float | int | bool]:
+    """Choose one safe padding ratio for all full-board photos in a group.
+
+    The tightest usable frame sets the group target. Each sibling therefore
+    receives the same board-relative padding without any crop inventing pixels.
+    """
+    vertical_support: list[float] = []
+    horizontal_support: list[float] = []
+    for case in cases:
+        if case.get("shot_type") != "full_board":
+            continue
+        boundary = case.get("classification", {}).get("opencv_boundary") or case.get("classification", {}).get("candidate")
+        image_size = case.get("image_size") or (0, 0)
+        if not boundary or len(boundary) < 4 or not image_size[0] or not image_size[1]:
+            continue
+        x, y, width, height = [float(value) for value in boundary[:4]]
+        image_width, image_height = [float(value) for value in image_size]
+        vertical_support.append(min(y, max(0.0, image_height - (y + height))) / max(height, 1.0))
+        horizontal_support.append(min(x, max(0.0, image_width - (x + width))) / max(height, 1.0))
+    if not vertical_support or not horizontal_support:
+        return {"available": False, "vertical": desired_vertical, "horizontal": desired_horizontal, "count": 0}
+    return {
+        "available": True,
+        "vertical": max(0.0, min(desired_vertical, min(vertical_support))),
+        "horizontal": max(0.0, min(desired_horizontal, min(horizontal_support))),
+        "count": len(vertical_support),
+    }
+
+
+def suggested_crop(image: Image.Image, shot_type: str = "full_board", padding: float = DEFAULT_CROP_PADDING, classification: dict[str, object] | None = None, rail_padding: float | None = None) -> tuple[int, int, int, int, str]:
     """Return an orientation-normalized pixel crop. No pixel is invented."""
     width, height = image.size
     candidate = None
@@ -269,7 +298,7 @@ def suggested_crop(image: Image.Image, shot_type: str = "full_board", padding: f
                 crop = _profile_crop(x, y, w, h, width, height, max(padding, DEFAULT_PROFILE_PADDING))
                 confidence = classification["confidence"] if classification else "contour"
                 return (*crop, f"OpenCV shot classifier: side-profile silhouette ({confidence})")
-            crop = _full_board_crop(x, y, w, h, width, height, padding)
+            crop = _full_board_crop(x, y, w, h, width, height, padding, DEFAULT_RAIL_PADDING if rail_padding is None else rail_padding)
             confidence = classification["confidence"] if classification else "contour"
             return (*crop, f"OpenCV {boundary_source}: full-board boundary ({confidence})")
     if shot_type == "fin_detail":
@@ -300,7 +329,7 @@ def suggested_crop(image: Image.Image, shot_type: str = "full_board", padding: f
     return (*crop, "OpenCV grayscale/edge board candidate")
 
 
-def rotated_crop_proposal(image: Image.Image, shot_type: str = "auto", padding: float = DEFAULT_CROP_PADDING, classification: dict[str, object] | None = None) -> dict[str, object]:
+def rotated_crop_proposal(image: Image.Image, shot_type: str = "auto", padding: float = DEFAULT_CROP_PADDING, classification: dict[str, object] | None = None, rail_padding: float | None = None) -> dict[str, object]:
     """Propose a small board-angle correction followed by a crop.
 
     The rotated image uses an expanded canvas, but a rotated crop is accepted
@@ -310,13 +339,13 @@ def rotated_crop_proposal(image: Image.Image, shot_type: str = "auto", padding: 
     classification = classification or classify_shot(image)
     resolved_type = classification["shot_type"] if shot_type == "auto" else shot_type
     if resolved_type not in {"full_board", "side_profile"}:
-        crop = suggested_crop(image, str(resolved_type), padding, classification=classification)
+        crop = suggested_crop(image, str(resolved_type), padding, classification=classification, rail_padding=rail_padding)
         reason = crop[4]
         return {"image": image, "crop": crop[:4], "shot_type": resolved_type, "angle": 0.0, "rotation_applied": False, "review": bool(classification.get("review", False)), "reason": reason}
     # Detect, refine, and pad in the original coordinate system first. The
     # rotation is deliberately the final transform; detector boxes must never
     # be reused against an image whose pixels have already moved.
-    base_crop = suggested_crop(image, str(resolved_type), padding, classification=classification)
+    base_crop = suggested_crop(image, str(resolved_type), padding, classification=classification, rail_padding=rail_padding)
     angle = estimate_board_angle(image, str(resolved_type))
     if abs(angle) < 0.75:
         return {"image": image, "crop": base_crop[:4], "shot_type": resolved_type, "angle": 0.0, "rotation_applied": False, "review": bool(classification.get("review", False)), "reason": f"board already nearly upright; {base_crop[4]}"}
