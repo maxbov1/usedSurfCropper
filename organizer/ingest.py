@@ -29,11 +29,10 @@ except ImportError:
     pass
 
 SUPPORTED = {".jpg", ".jpeg", ".png", ".heic"}
-PROCESSING_VERSION = "0.8.0-card-session-state-machine"
+PROCESSING_VERSION = "0.9.0-contiguous-card-sessions"
 MAX_PHOTOS_PER_BOARD = 7
 STANDARD_BOARD_PHOTOS = 6
 SHOT_LIMITS = {"full_board": 4, "side_profile": 1, "fin_detail": 1, "card": 1}
-CARD_AFFINITY_GAP = 0.045
 
 
 def visual_signature(image: Image.Image) -> tuple[float, ...]:
@@ -73,25 +72,6 @@ def visual_distance(left: dict, right: dict) -> float:
         return 0.0
     a, b = np.asarray(first, dtype=np.float32), np.asarray(second, dtype=np.float32)
     return float(np.mean(np.abs(a - b)))
-
-
-def card_visual_affinity(card: dict, photos: list[dict]) -> float | None:
-    """Return the card's visual distance to the closest board-photo cluster.
-
-    OCR remains the authoritative source for SKU/model/brand. This is the
-    visual companion signal: cards often show the board and its identifying
-    details in the same frame, so a card should help choose between adjacent
-    board-photo clusters even when capture timestamps are misleading.
-    """
-    distances = sorted(
-        visual_distance(card, photo)
-        for photo in photos
-        if not photo.get("is_card") and photo.get("visual_signature")
-    )
-    if not distances:
-        return None
-    nearest = distances[: min(3, len(distances))]
-    return sum(nearest) / len(nearest)
 
 
 def sha256(path: Path) -> str:
@@ -424,9 +404,9 @@ def group_scanned(files: list[dict]) -> list[list[dict]]:
     """Group a capture-ordered batch using the known capture protocol.
 
     A normal board session is six board views, optionally accompanied by one
-    identity card and one fin/detail view. Cards delimit identity sessions;
-    visual/ML signals validate a session and handle an actual protocol
-    violation, but do not choose an arbitrary timestamp-based cut point.
+    identity card and one fin/detail view. A card belongs to the contiguous
+    session in which it was photographed; the next card closes that session.
+    Visual/ML signals do not choose an arbitrary timestamp-based cut point.
     """
     if not files:
         return []
@@ -461,55 +441,7 @@ def group_scanned(files: list[dict]) -> list[list[dict]]:
             current = []
     if current:
         groups.append(current)
-    # A card-bearing session is the only place where visual evidence may
-    # split a group: it is a protocol-violation guard, not the normal grouper.
-    card_anchored = _split_card_anchor_mismatches([group for group in groups if group])
-    return _enforce_shot_limits(card_anchored)
-
-
-def _split_card_anchor_mismatches(groups: list[list[dict]]) -> list[list[dict]]:
-    """Keep a card with the visually matching side of a mixed board group.
-
-    A card is an identity anchor, but its yellow/card layout is not itself a
-    hard board boundary. We therefore look for a sustained affinity jump in
-    the surrounding non-card sequence. This catches a blue board followed by
-    a white board inside one timestamp bucket without splitting ordinary
-    lighting/angle changes.
-    """
-    partitioned: list[list[dict]] = []
-    for group in groups:
-        cards = [item for item in group if item.get("is_card")]
-        photos = [item for item in group if not item.get("is_card")]
-        if len(cards) != 1 or len(photos) < 4:
-            partitioned.append(group)
-            continue
-        card = cards[0]
-        affinities = [visual_distance(card, photo) for photo in photos]
-        candidates = []
-        for cut in range(2, len(photos) - 1):
-            left = affinities[:cut]
-            right = affinities[cut:]
-            left_mean = sum(left) / len(left)
-            right_mean = sum(right) / len(right)
-            gap = abs(left_mean - right_mean)
-            if gap >= CARD_AFFINITY_GAP:
-                candidates.append((gap, cut, left_mean, right_mean))
-        if not candidates:
-            partitioned.append(group)
-            continue
-        _, cut, _, _ = max(candidates, key=lambda value: value[0])
-        left_photos, right_photos = photos[:cut], photos[cut:]
-        left_affinity = card_visual_affinity(card, left_photos)
-        right_affinity = card_visual_affinity(card, right_photos)
-        if left_affinity is None or right_affinity is None:
-            partitioned.append(group)
-            continue
-        matching_side = "left" if left_affinity <= right_affinity else "right"
-        if matching_side == "left":
-            partitioned.extend([left_photos + [card], right_photos])
-        else:
-            partitioned.extend([left_photos, [card] + right_photos])
-    return [group for group in partitioned if group]
+    return _enforce_shot_limits([group for group in groups if group])
 
 
 def shot_bucket(item: dict) -> str | None:

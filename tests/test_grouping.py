@@ -64,26 +64,27 @@ class GroupingTests(unittest.TestCase):
         self.assertEqual(group_limit_violations(groups[0]), {})
         self.assertEqual(group_limit_violations(groups[1]), {})
 
-    def test_visual_boundary_splits_different_boards_inside_card_group(self):
+    def test_capture_session_stays_contiguous_across_visual_change(self):
         items = [
             {**photo("CARD.JPG", card=True), "shot_type": "card"},
-            *[{**photo(f"BLUE_{index}.JPG", value=0.0), "shot_type": "full_board"} for index in range(3)],
-            *[{**photo(f"WHITE_{index}.JPG", value=0.2), "shot_type": "full_board"} for index in range(3)],
+            *[photo(f"BLUE_{index}.JPG", value=0.0) for index in range(3)],
+            *[photo(f"WHITE_{index}.JPG", value=0.2) for index in range(3)],
         ]
         groups = group_scanned(items)
-        self.assertEqual([len(group) for group in groups], [4, 3])
+        self.assertEqual([len(group) for group in groups], [7])
+        self.assertEqual(sum(item["is_card"] for item in groups[0]), 1)
 
-    def test_card_affinity_keeps_card_with_matching_board_side(self):
+    def test_card_stays_with_following_session_when_taken_first(self):
         items = [
             {**photo("CARD.JPG", card=True, value=0.0), "shot_type": "card"},
-            *[{**photo(f"BLUE_{index}.JPG", value=0.0), "shot_type": "full_board"} for index in range(3)],
-            *[{**photo(f"WHITE_{index}.JPG", value=0.2), "shot_type": "full_board"} for index in range(3)],
+            *[photo(f"BLUE_{index}.JPG", value=0.0) for index in range(3)],
+            *[photo(f"WHITE_{index}.JPG", value=0.2) for index in range(3)],
         ]
         groups = group_scanned(items)
-        self.assertEqual([len(group) for group in groups], [4, 3])
+        self.assertEqual([len(group) for group in groups], [7])
         self.assertTrue(any(item.get("is_card") for item in groups[0]))
 
-    def test_card_affinity_can_move_late_card_to_matching_side(self):
+    def test_card_stays_with_preceding_session_when_taken_last(self):
         items = [
             *[{**photo(f"BLUE_{index}.JPG", value=0.0), "shot_type": "full_board"} for index in range(3)],
             {**photo("CARD.JPG", card=True, value=0.2), "shot_type": "card"},
