@@ -1,0 +1,45 @@
+{
+    "invocation": {
+    "request_sha256": "447f802f9c61241e9ecefaa58a8da142bbf0c0b2265e58f53f114f1f2c5f4e3c"
+  },
+  "laws": {
+    "general": [
+      {
+        "id": "feedback.truthful",
+        "statement": "Code generated should not treat an intermediate UI state as a finalized human label."
+      },
+      {
+        "id": "state.observable",
+        "statement": "Code generated should not discard the model proposal or the human-saved result needed to explain a later model decision."
+      },
+      {
+        "id": "grouping.initial-snapshot",
+        "statement": "Code generated should not overwrite the complete initial grouping when a human begins dragging photos."
+      }
+    ],
+    "feature": [
+      {
+        "id": "grouping.final-boundary",
+        "statement": "Code generated should not write grouping feedback as final until the user submits Save grouping and crop."
+      },
+      {
+        "id": "grouping.complete-labels",
+        "statement": "Code generated should not train from only moved photos when unchanged final assignments are available; every reviewed photo needs an initial and final assignment."
+      },
+      {
+      }
+    ],
+    "negative_tests": [
+      {
+        "name": "grouping feedback schema persists versioned state",
+        "law_id": "state.observable",
+        "production": "organizer/db.py",
+        "command": ["python3", "-m", "unittest", "tests.test_production.ProductionLifecycleTests.test_metadata_and_schema_version_are_persisted"],
+        "timeout_seconds": 60
+      }
+    ]
+  },
+  "check_laws": {
+    "swallowed_failures": ["feedback.truthful"]
+  }
+}

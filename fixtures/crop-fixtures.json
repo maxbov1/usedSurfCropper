@@ -1,0 +1,139 @@
+{
+  "version": "0.1",
+  "source": "sample-pack/usedsurf-crop-sample-pack",
+  "ground_truth_status": "behavioral-fixtures-only",
+  "note": "The pack has no original/finished pixel-aligned pairs. These cases define expected crop behavior and must receive human rectangles before numeric accuracy is reported.",
+  "gallery_contract": {
+    "required_order": [
+      {"shot_type": "deck_full_light", "label": "deck full light", "crop_policy": "complete board, tight margin"},
+      {"shot_type": "deck_low_light", "label": "deck low light", "crop_policy": "same complete-board crop; preserve pressure-ding visibility"},
+      {"shot_type": "bottom_full_light", "label": "bottom full light", "crop_policy": "complete board, tight margin"},
+      {"shot_type": "bottom_low_light", "label": "bottom low light", "crop_policy": "same complete-board crop; preserve pressure-ding visibility"},
+      {"shot_type": "rail_full_light", "label": "rail full light", "crop_policy": "preserve full rail/rocker and any protruding fins; no warping"}
+    ],
+    "optional_order": [
+      {"shot_type": "fins_closeup", "label": "fins close-up", "crop_policy": "preserve original detail framing unless reviewer adjusts it"}
+    ],
+    "naming_note": "Deck/bottom are intentional gallery labels; low-light views remain separate because they reveal pressure dings."
+  },
+  "sequence_variants": [
+    {
+      "id": "standard-five-view",
+      "required_order": ["card", "deck_full_light", "deck_low_light", "bottom_full_light", "bottom_low_light", "rail_full_light"],
+      "optional_after_profile": ["fins_closeup"],
+      "rule": "The optional photo may be absent; absence is not a failure."
+    },
+    {
+      "id": "extra-accessory-view",
+      "required_order": ["card", "deck_full_light", "deck_low_light", "bottom_full_light", "bottom_low_light", "rail_full_light"],
+      "optional_after_profile": ["fins_closeup"],
+      "rule": "If present, retain the extra photo as its own gallery item and classify it independently."
+    }
+  ],
+  "cases": [
+    {
+      "id": "full-deck-white-low-contrast",
+      "files": ["synthetic-input/sample-01.png", "synthetic-input/sample-08.png", "synthetic-input/sample-09.png", "synthetic-input/sample-10.png"],
+      "shot_type": "full_board",
+      "pattern": "upright board on gray wall/floor, light board with dark traction pad",
+      "rules": [
+        "include complete nose and tail",
+        "include traction pad and attached leash plug",
+        "exclude cast shadow where possible",
+        "keep a small, configurable margin rather than cropping to the shadow"
+      ],
+      "if_clauses": [
+        "if the board edge is low contrast against the wall, do not use the shadow as the board boundary",
+        "if the floor/wall seam is inside the candidate box, it is background, not a board landmark"
+      ],
+      "failure_labels": ["clipped_nose", "clipped_tail", "shadow_included", "under_crop"]
+    },
+    {
+      "id": "full-bottom-fins",
+      "files": ["synthetic-input/sample-05.png", "synthetic-input/sample-07.png"],
+      "shot_type": "full_board",
+      "pattern": "bottom view with visible fin boxes/fins and strong board graphics",
+      "rules": [
+        "include every attached fin and protruding fin tip",
+        "include tail shape and all rails",
+        "do not mistake dark fins, logos, or traction material for background"
+      ],
+      "if_clauses": [
+        "if fins extend beyond the main silhouette, expand the crop to include them",
+        "if a fin is visually merged with the board, use its attached geometry rather than color alone"
+      ],
+      "failure_labels": ["clipped_fin", "clipped_tail", "foreground_split"]
+    },
+    {
+      "id": "profile-rocker",
+      "files": ["synthetic-input/sample-02.png", "synthetic-input/sample-04.png", "synthetic-input/sample-06.png"],
+      "shot_type": "side_profile",
+      "pattern": "very thin board with visible rocker; some images include a support stand",
+      "rules": [
+        "preserve the full rocker from nose to tail",
+        "preserve protruding fins and rail curvature",
+        "do not straighten, rotate, or warp the board",
+        "use a minimum crop width so the board is not rendered as a sliver"
+      ],
+      "if_clauses": [
+        "if a support stand is visible, exclude it when possible without clipping the board or fins",
+        "if the board and stand touch, route to review instead of guessing the separation",
+        "if the profile nearly disappears against the wall, keep the full frame as a safe fallback"
+      ],
+      "failure_labels": ["clipped_rocker", "clipped_fin", "stand_included", "warped_profile", "false_negative"]
+    },
+    {
+      "id": "detail-preserve-original",
+      "files": ["synthetic-input/sample-03.png"],
+      "shot_type": "fins_closeup",
+      "pattern": "optional extra photo; partial, close-range accessory/condition shot; board continues beyond the frame",
+      "rules": [
+        "preserve original framing by default",
+        "do not try to find a complete board silhouette",
+        "do not expand or invent missing content"
+      ],
+      "if_clauses": [
+        "if the image is partial or close-range, classify as detail even when board pixels dominate",
+        "if no full-board candidate is visible, keep original rather than forcing a board crop"
+      ],
+      "failure_labels": ["over_cropped_detail", "invented_content", "misclassified_full_board"]
+    },
+    {
+      "id": "optional-fins-photo",
+      "files": [],
+      "shot_type": "fins_closeup",
+      "pattern": "optional extra photo present for some boards, absent for others",
+      "rules": [
+        "do not require this photo for every board",
+        "if present, preserve it as a separate source and export item",
+        "classify it independently from full-board and profile views"
+      ],
+      "if_clauses": [
+        "if a board has no separate fins close-up, do not create a placeholder",
+        "if fins are visible in a normal face or rail shot, that does not make the shot fins_closeup",
+        "if the extra photo is a close-up, keep original framing unless the reviewer chooses a crop"
+      ],
+      "failure_labels": ["missing_optional_photo", "invented_placeholder", "misclassified_full_view", "over_cropped_accessory"]
+    },
+    {
+      "id": "paired-views-are-independent",
+      "files": [
+        "synthetic-input/sample-01.png",
+        "synthetic-input/sample-08.png",
+        "synthetic-input/sample-05.png"
+      ],
+      "shot_type": "full_board",
+      "pattern": "multiple views of the same board with different pressure dents, graphics, and fin layouts",
+      "rules": [
+        "keep every source photo as a separate gallery item",
+        "apply crop independently per photo",
+        "never deduplicate by visual similarity"
+      ],
+      "if_clauses": [
+        "if two views belong to one board, group them but do not merge their files",
+        "if a paired view has a different crop need, preserve that correction independently"
+      ],
+      "failure_labels": ["deduplicated_view", "wrong_gallery_order", "shared_crop_when_individual_needed"]
+    }
+  ]
+}

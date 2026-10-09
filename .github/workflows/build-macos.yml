@@ -1,0 +1,40 @@
+name: Build macOS app
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-13
+            name: intel
+          - runner: macos-14
+            name: apple-silicon
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install runtime and packaging dependencies
+        run: python -m pip install -r requirements.txt -r requirements-build.txt
+      - name: Build app bundle
+        env:
+          APP_ARCH: ${{ matrix.name }}
+        run: bash scripts/build_mac_app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UsedSurf-macOS-${{ matrix.name }}
+          path: dist/UsedSurf-macOS-${{ matrix.name }}.zip
+      - name: Upload tagged release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/UsedSurf-macOS-${{ matrix.name }}.zip --clobber

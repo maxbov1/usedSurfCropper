@@ -1,0 +1,5 @@
+<link rel="stylesheet" href="{{ url_for('static', filename='ui.css') }}">
+<nav class="site-nav" aria-label="Primary navigation">
+<a class="site-brand" href="{{ url_for('index') }}"><img src="{{ url_for('static', filename='assets/usedsurf-logo.png') }}" alt="UsedSurf"><span>Cropper</span></a>
+<div class="site-nav-links"><a class="site-nav-link" href="{{ url_for('upload_photos') }}">Upload</a><a class="site-nav-link" href="{{ url_for('rules') }}">Rules</a><a class="site-nav-link" href="{{ url_for('how_to') }}">How To</a><details class="advanced-debug"><summary>Advanced debug</summary><div class="advanced-debug-menu"><a href="{{ url_for('debug_center') }}">Debug overview</a><a href="{{ url_for('runs') }}">Run control center</a></div></details></div>
+</nav>

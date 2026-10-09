@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Runs · UsedSurf</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='ui.css') }}">
+</head>
+<body>
+<main class="shell runs-shell">
+  {% include "_site_nav.html" %}
+  <header class="page-header runs-header">
+    <div><p class="eyebrow">LOCAL CONTROL CENTER</p><h1>Runs</h1><p class="lede">See what the pipeline did, recover abandoned work, and restart crop jobs without touching your originals.</p></div>
+    <form method="post" action="{{ url_for('recover_runs') }}"><button class="secondary" type="submit">Recover abandoned runs</button></form>
+  </header>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}<div class="notice{% if category == 'error' %} error{% endif %}">{{ message }}</div>{% endfor %}
+  {% endwith %}
+  {% if not runs %}<section class="empty panel"><h2>No runs yet</h2><p class="muted">Start grouping or crop review to create the first run record.</p></section>{% endif %}
+  <section class="run-list" aria-label="Pipeline runs">
+  {% for run in runs %}
+    <article class="run-row{% if run.stale %} run-stale{% endif %}">
+      <div class="run-main"><div class="run-title"><strong>{{ run.kind|replace('_', ' ')|title }}</strong><span class="status {{ run.status }}">{{ 'stale' if run.stale else run.status }}</span></div><a class="run-id" href="{{ url_for('run_detail', run_id=run.run_id) }}"><code>{{ run.run_id }}</code></a><small>{{ run.created_at }}{% if run.error %} · {{ run.error }}{% endif %}</small></div>
+      <div class="run-meta"><span>{{ run.artifact_count }} artifacts</span>{% if run.started_at %}<span>started {{ run.started_at }}</span>{% endif %}</div>
+      <div class="run-actions">
+        {% if run.stale %}<form method="post" action="{{ url_for('recover_run', run_id=run.run_id) }}"><button class="action-link" type="submit">Mark failed</button></form>{% endif %}
+        {% if run.status in ['failed', 'complete'] and run.kind in ['crop', 'true_crop_eval'] %}<form method="post" action="{{ url_for('restart_run', run_id=run.run_id) }}"><button class="action-link" type="submit">Restart</button></form>{% endif %}
+      </div>
+    </article>
+  {% endfor %}
+  </section>
+</main>
+</body>
+</html>

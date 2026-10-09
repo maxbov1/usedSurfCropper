@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Advanced debug · UsedSurf</title><link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}"><link rel="stylesheet" href="{{ url_for('static', filename='ui.css') }}"></head>
+<body><main class="shell debug-shell">
+  {% include "_site_nav.html" %}
+  <header class="page-header"><div><p class="eyebrow">TECHNICAL TOOLS</p><h1>Advanced debug</h1><p class="lede">Local-only diagnostics and recovery tools. These controls are for troubleshooting a stalled or incomplete batch.</p></div><a class="secondary action-button" href="{{ url_for('runs') }}">Open run control center</a></header>
+  <section class="debug-grid" aria-label="System health">
+    <article class="debug-card"><span>Database schema</span><strong>v{{ schema_version }}</strong><small>{{ db_path }}</small></article>
+    <article class="debug-card"><span>Active photos</span><strong>{{ active_photos }}</strong><small>currently in input/</small></article>
+    <article class="debug-card"><span>Runs needing attention</span><strong>{{ failed_runs + running_runs }}</strong><small>{{ failed_runs }} failed · {{ running_runs }} active</small></article>
+    <article class="debug-card"><span>Stored artifacts</span><strong>{{ artifact_count }}</strong><small>{{ archive_count }} archive folder(s)</small></article>
+    <article class="debug-card"><span>OpenCV</span><strong class="{{ 'check-good' if cv2_available else 'check-bad' }}">{{ 'available' if cv2_available else 'missing' }}</strong><small>crop fallback and diagnostics</small></article>
+    <article class="debug-card"><span>YOLO weights</span><strong class="{{ 'check-good' if yolo_available else 'check-warn' }}">{{ 'available' if yolo_available else 'not found' }}</strong><small>local yolo11n.pt</small></article>
+    <article class="debug-card"><span>Free disk</span><strong class="{{ 'check-warn' if free_gb < 2 else 'check-good' }}">{{ '%.1f'|format(free_gb) }} GB</strong><small>keep at least 2 GB free</small></article>
+    <article class="debug-card"><span>GitHub updates</span><strong class="{{ 'check-good' if update_status.status == 'ok' else 'check-warn' }}">{{ update_status.status|replace('_', ' ') }}</strong><small>{{ update_status.latest_sha or update_status.checked_at or 'set USED_SURF_GITHUB_REPO to enable' }}</small></article>
+  </section>
+  <section class="debug-panel"><h2>Recovery actions</h2><p class="muted">A run marked stale is not deleted and its outputs are not overwritten. Recover it first, then restart it from the run control center.</p><div class="action-row"><form method="post" action="{{ url_for('recover_runs') }}"><button class="secondary" type="submit">Recover abandoned runs</button></form><a class="action-link" href="{{ url_for('runs') }}">Inspect all runs</a><a class="action-link" href="{{ url_for('retention_review') }}">Review archive retention</a></div></section>
+  <section class="debug-panel"><h2>When asking for help</h2><p class="muted">Include the run ID, the error text shown in the run detail page, and the artifact paths. Originals remain in <code>input/</code> or the dated folder under <code>data/archive/</code>.</p><p class="debug-command"><code>./doctor.sh</code> checks the local installation from Terminal.</p></section>
+</main></body></html>

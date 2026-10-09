@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Run detail · UsedSurf</title><link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}"><link rel="stylesheet" href="{{ url_for('static', filename='ui.css') }}"></head>
+<body><main class="shell debug-shell">
+  {% include "_site_nav.html" %}<a class="back" href="{{ url_for('runs') }}">← all runs</a>
+  <header class="page-header"><div><p class="eyebrow">RUN DETAIL</p><h1>{{ run.kind|replace('_', ' ')|title }}</h1><p class="run-detail-id"><code>{{ run.run_id }}</code></p></div><span class="status {{ run.status }} run-detail-status">{{ run.status }}</span></header>
+  {% if run.error %}<div class="notice error">{{ run.error }}</div>{% endif %}
+  <section class="debug-panel"><h2>Timeline</h2><div class="timeline"><div><span>Created</span><strong>{{ run.created_at }}</strong></div><div><span>Started</span><strong>{{ run.started_at or '—' }}</strong></div><div><span>Completed</span><strong>{{ run.completed_at or '—' }}</strong></div><div><span>Worker</span><strong>{{ run.worker_pid or '—' }}</strong></div></div><p class="debug-command"><a class="action-link" href="{{ url_for('run_log', run_id=run.run_id) }}" target="_blank" rel="noreferrer">Open log tail</a> <span class="muted">{{ run.log_path or 'No log path recorded' }}</span></p></section>
+  <section class="debug-panel"><h2>Artifacts <small class="muted">{{ artifacts|length }} recorded</small></h2>{% if artifacts %}<div class="artifact-list">{% for artifact in artifacts %}<div class="artifact-row"><div><strong>{{ artifact.kind|replace('_', ' ') }}</strong><code>{{ artifact.relative_path }}</code></div><span>{{ artifact.size_bytes|filesizeformat }} · {{ artifact.sha256[:12] }}</span></div>{% endfor %}</div>{% else %}<p class="muted">No artifacts were recorded for this run.</p>{% endif %}</section>
+</main></body></html>

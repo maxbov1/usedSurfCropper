@@ -1,0 +1,1 @@
+Make grouping feedback a trustworthy learning dataset: persist the complete initial grouping, then persist only the complete final grouping submitted by the human when they click Save grouping and crop. Intermediate drag states must not be treated as labels.

@@ -1,0 +1,14 @@
+.venv/
+.venv-build/
+.venv-sam2/
+.DS_Store
+__pycache__/
+*.pyc
+data/
+input/*
+output/*
+yolo11n.pt
+build/
+dist/
+.pyinstaller/
+*.spec.bak
