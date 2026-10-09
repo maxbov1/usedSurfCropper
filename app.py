@@ -41,18 +41,28 @@ def show_fatal_startup_error(phase: str, error: BaseException) -> None:
             def applescript_string(value: str) -> str:
                 return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
 
-            subprocess.run(
+            dialog = subprocess.run(
                 [
                     "/usr/bin/osascript",
                     "-e",
                     "display alert " + applescript_string("UsedSurf failed to start") +
                     " message " + applescript_string(message) +
-                    " as critical buttons {\"OK\"}",
+                    " as critical buttons {\"Open Log\", \"OK\"} default button \"Open Log\"",
                 ],
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
+            if dialog.returncode == 0 and "Open Log" in dialog.stdout:
+                opened = subprocess.run(
+                    ["/usr/bin/open", "-a", "TextEdit", str(log_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                write_startup_log(
+                    f"Fatal error log open requested; exit={opened.returncode}; stderr={opened.stderr.strip()!r}"
+                )
             return
         except Exception:
             pass
