@@ -63,6 +63,15 @@ class GroupingTests(unittest.TestCase):
         self.assertEqual(group_limit_violations(groups[0]), {})
         self.assertEqual(group_limit_violations(groups[1]), {})
 
+    def test_visual_boundary_splits_different_boards_inside_card_group(self):
+        items = [
+            {**photo("CARD.JPG", card=True), "shot_type": "card"},
+            *[{**photo(f"BLUE_{index}.JPG", value=0.0), "shot_type": "full_board"} for index in range(3)],
+            *[{**photo(f"WHITE_{index}.JPG", value=0.2), "shot_type": "full_board"} for index in range(3)],
+        ]
+        groups = group_scanned(items)
+        self.assertEqual([len(group) for group in groups], [4, 3])
+
     def test_uncertain_generic_details_do_not_trigger_fin_limit(self):
         items = [
             {**photo("DETAIL-1.JPG"), "shot_type": "detail"},

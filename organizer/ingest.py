@@ -33,6 +33,7 @@ PROCESSING_VERSION = "0.4.0-late-card-reconciliation"
 MAX_PHOTOS_PER_BOARD = 7
 PREFERRED_PHOTOS_PER_BOARD = 6
 SHOT_LIMITS = {"full_board": 4, "side_profile": 1, "fin_detail": 1, "card": 1}
+VISUAL_HARD_BOUNDARY = 0.10
 
 
 def visual_signature(image: Image.Image) -> tuple[float, ...]:
@@ -472,7 +473,30 @@ def group_scanned(files: list[dict]) -> list[list[dict]]:
     if pending_cards:
         groups.append(pending_cards)
     reconciled = _reconcile_late_card_groups([group for group in groups if group])
-    return _enforce_shot_limits(reconciled)
+    visually_partitioned = _split_visual_boundaries(reconciled)
+    return _enforce_shot_limits(visually_partitioned)
+
+
+def _split_visual_boundaries(groups: list[list[dict]]) -> list[list[dict]]:
+    """Split a timestamp group when neighboring non-card frames visibly jump."""
+    partitioned: list[list[dict]] = []
+    for group in groups:
+        if len(group) < 3:
+            partitioned.append(group)
+            continue
+        start = 0
+        for index in range(1, len(group)):
+            left, right = group[index - 1], group[index]
+            # Cards are intentionally allowed to differ from the board photos;
+            # their OCR/card signal is the boundary evidence instead.
+            if left.get("is_card") or right.get("is_card"):
+                continue
+            if visual_distance(left, right) >= VISUAL_HARD_BOUNDARY:
+                partitioned.append(group[start:index])
+                start = index
+        if start < len(group):
+            partitioned.append(group[start:])
+    return [group for group in partitioned if group]
 
 
 def shot_bucket(item: dict) -> str | None:
