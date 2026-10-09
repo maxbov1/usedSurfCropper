@@ -26,13 +26,48 @@ def write_startup_log(message: str) -> None:
         pass
 
 
+def show_fatal_startup_error(phase: str, error: BaseException) -> None:
+    """Make windowless app failures visible instead of only bouncing in the Dock."""
+    details = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    log_path = startup_log_path()
+    write_startup_log(f"Fatal startup failure during {phase}:\n{details}")
+    message = (
+        f"UsedSurf could not start during {phase}.\n\n"
+        f"{type(error).__name__}: {error}\n\n"
+        f"A full diagnostic was saved to:\n{log_path}"
+    )
+    if sys.platform == "darwin":
+        try:
+            def applescript_string(value: str) -> str:
+                return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+            subprocess.run(
+                [
+                    "/usr/bin/osascript",
+                    "-e",
+                    "display alert " + applescript_string("UsedSurf failed to start") +
+                    " message " + applescript_string(message) +
+                    " as critical buttons {\"OK\"}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return
+        except Exception:
+            pass
+    # This is useful when launching from Terminal or a non-macOS environment.
+    print(message, file=sys.stderr)
+
+
 try:
     from organizer.config import runtime_root
     from organizer.update_check import check_github_async
     from organizer.web import create_app
 except Exception:
-    write_startup_log("Import failure:\n" + traceback.format_exc())
-    raise
+    error = sys.exc_info()[1]
+    show_fatal_startup_error("importing the application", error or RuntimeError("unknown import error"))
+    raise SystemExit(1)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -56,8 +91,9 @@ try:
     app = create_app(RUNTIME_ROOT)
     write_startup_log(f"App initialized; frozen={getattr(sys, 'frozen', False)}; runtime={RUNTIME_ROOT}")
 except Exception:
-    write_startup_log("Initialization failure:\n" + traceback.format_exc())
-    raise
+    error = sys.exc_info()[1]
+    show_fatal_startup_error("initializing the application", error or RuntimeError("unknown initialization error"))
+    raise SystemExit(1)
 
 
 def open_browser_when_ready(url: str, port: int) -> None:
@@ -122,10 +158,13 @@ def run_worker_mode() -> int:
         return main()
     return -1
 
-if __name__ == "__main__":
+def main() -> None:
     worker_result = run_worker_mode()
     if worker_result >= 0:
-        raise SystemExit(worker_result)
+        return_code = worker_result
+        if return_code:
+            raise RuntimeError(f"worker exited with status {return_code}")
+        return
     # Keep the local server reachable during long OCR/cropping runs. The
     # assertion is tied to this process and disappears when the app exits.
     if sys.platform == "darwin":
@@ -144,3 +183,13 @@ if __name__ == "__main__":
         threading.Thread(target=open_browser_when_ready, args=(f"http://127.0.0.1:{port}/upload-photos", port), daemon=True).start()
     check_github_async(RUNTIME_ROOT, on_update=offer_update)
     app.run(host="127.0.0.1", port=port, debug=False)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as error:
+        show_fatal_startup_error("starting the local server", error)
+        raise SystemExit(1)
