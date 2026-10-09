@@ -381,7 +381,12 @@ def create_app(root: Path) -> Flask:
         with db() as conn:
             previous = conn.execute("SELECT value FROM app_meta WHERE key='active_input_signature'").fetchone()
             active_count = conn.execute("SELECT COUNT(*) n FROM photos WHERE source_path LIKE 'input/%'").fetchone()["n"]
-        if previous and previous["value"] == signature and active_count:
+            previous_grouping = conn.execute(
+                "SELECT pipeline_version FROM grouping_feedback_batches WHERE input_signature=? ORDER BY created_at DESC LIMIT 1",
+                (signature,),
+            ).fetchone()
+        grouping_is_current = previous_grouping and previous_grouping["pipeline_version"] == PROCESSING_VERSION
+        if previous and previous["value"] == signature and active_count and grouping_is_current:
             ocr_status_path = directories["data"] / "ocr-status.json"
             saved_ocr_runtime = {}
             try:

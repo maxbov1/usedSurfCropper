@@ -29,7 +29,7 @@ except ImportError:
     pass
 
 SUPPORTED = {".jpg", ".jpeg", ".png", ".heic"}
-PROCESSING_VERSION = "0.7.0-capture-protocol-grouping"
+PROCESSING_VERSION = "0.8.0-card-session-state-machine"
 MAX_PHOTOS_PER_BOARD = 7
 STANDARD_BOARD_PHOTOS = 6
 SHOT_LIMITS = {"full_board": 4, "side_profile": 1, "fin_detail": 1, "card": 1}
