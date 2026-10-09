@@ -45,6 +45,12 @@ class GroupingTests(unittest.TestCase):
         self.assertEqual([sum(item["is_card"] for item in group) for group in groups], [1, 1, 1])
         self.assertEqual([group[-1]["path"].name for group in groups], ["CARD-1.JPG", "CARD-2.JPG", "THIRD_4.JPG"])
 
+    def test_oversized_capture_is_split_under_hard_group_cap(self):
+        items = [photo(f"IMG_{index}.JPG", value=0.0) for index in range(13)]
+        groups = group_scanned(items)
+        self.assertEqual(sum(len(group) for group in groups), 13)
+        self.assertTrue(all(len(group) <= 8 for group in groups))
+
 
 if __name__ == "__main__":
     unittest.main()

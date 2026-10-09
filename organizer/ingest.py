@@ -29,7 +29,7 @@ except ImportError:
 
 SUPPORTED = {".jpg", ".jpeg", ".png", ".heic"}
 PROCESSING_VERSION = "0.4.0-late-card-reconciliation"
-MAX_PHOTOS_PER_BOARD = 7
+MAX_PHOTOS_PER_BOARD = 8
 PREFERRED_PHOTOS_PER_BOARD = 6
 
 

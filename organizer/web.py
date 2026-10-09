@@ -21,7 +21,7 @@ from .config import model_path, paths
 from .crop import _silhouette_mask
 from .db import connect, create_run, record_artifact, recover_stale_runs, set_run_worker, update_run
 from .export import export_board, safe_name
-from .ingest import PROCESSING_VERSION, group_scanned, read_image, scan_files
+from .ingest import MAX_PHOTOS_PER_BOARD, PROCESSING_VERSION, group_scanned, read_image, scan_files
 from .retention import compact_archive, persist_manifest, prepare_archive
 
 try:
@@ -635,7 +635,11 @@ def create_app(root: Path) -> Flask:
                 photo_data = [dict(row) for row in photos]
                 retest_mode = False
             conn.commit()
-        return render_template("shuffleboard.html", boards=boards, photos=photo_data, predictions=predictions, retest=retest, retest_mode=retest_mode, retest_name=retest_path.name if retest_path else "", grouping_run_id=grouping_run_id)
+        group_counts = {}
+        for photo in photo_data:
+            group_counts[str(photo["board_id"])] = group_counts.get(str(photo["board_id"]), 0) + 1
+        oversized_groups = {group_id: count for group_id, count in group_counts.items() if count > MAX_PHOTOS_PER_BOARD}
+        return render_template("shuffleboard.html", boards=boards, photos=photo_data, predictions=predictions, retest=retest, retest_mode=retest_mode, retest_name=retest_path.name if retest_path else "", grouping_run_id=grouping_run_id, max_photos_per_board=MAX_PHOTOS_PER_BOARD, oversized_groups=oversized_groups)
 
     @app.post("/shuffleboard/save")
     def save_shuffleboard():
@@ -675,19 +679,55 @@ def create_app(root: Path) -> Flask:
         with db() as conn:
             allowed_photos = {str(row["id"]): row for row in conn.execute("SELECT id, board_id FROM photos WHERE source_path LIKE 'input/%'")}
             allowed_boards = {row["id"] for row in conn.execute("SELECT id FROM boards")}
+            new_board_ids = {str(value) for value in (payload.get("new_board_ids") or [])}
+            new_board_map = {}
+            for new_id in sorted(new_board_ids):
+                if not new_id.startswith("new-"):
+                    continue
+                label = f"manual-group-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{len(new_board_map) + 1:02d}"
+                created = conn.execute(
+                    "INSERT INTO boards(label, status, created_at, processing_version) VALUES (?,?,?,?,?)",
+                    (label, "unreviewed", datetime.now().isoformat(timespec="seconds"), PROCESSING_VERSION),
+                )
+                new_board_map[new_id] = int(created.lastrowid)
+                allowed_boards.add(int(created.lastrowid))
             feedback_run_id = str(payload.get("grouping_run_id") or "")
             if not feedback_run_id:
                 active_grouping = conn.execute("SELECT value FROM app_meta WHERE key='active_grouping_run_id'").fetchone()
                 feedback_run_id = active_grouping["value"] if active_grouping else ""
             feedback = {str(row["photo_id"]): row for row in conn.execute("SELECT * FROM grouping_feedback WHERE run_id=?", (feedback_run_id,))} if feedback_run_id else {}
             final_assignments = payload.get("final_assignments") or payload.get("assignments") or {}
+            normalized_assignments = {
+                str(photo_id): new_board_map.get(str(board_id), board_id)
+                for photo_id, board_id in final_assignments.items()
+            }
+            counts = {}
+            for photo_id, board_id in normalized_assignments.items():
+                if photo_id in allowed_photos:
+                    try:
+                        counts[int(board_id)] = counts.get(int(board_id), 0) + 1
+                    except (TypeError, ValueError):
+                        continue
+            oversized = {board_id: count for board_id, count in counts.items() if count > MAX_PHOTOS_PER_BOARD}
+            if oversized:
+                conn.rollback()
+                return jsonify({
+                    "error": "Split oversized groups before saving: " + ", ".join(
+                        f"group {board_id} has {count} photos (maximum {MAX_PHOTOS_PER_BOARD})"
+                        for board_id, count in oversized.items()
+                    )
+                }), 400
             now = datetime.now().isoformat(timespec="seconds")
             moved = 0
-            for photo_id, board_id in final_assignments.items():
-                if str(photo_id) not in allowed_photos or int(board_id) not in allowed_boards:
+            for photo_id, board_id in normalized_assignments.items():
+                try:
+                    board_id_int = int(board_id)
+                except (TypeError, ValueError):
+                    continue
+                if str(photo_id) not in allowed_photos or board_id_int not in allowed_boards:
                     continue
                 photo = allowed_photos[str(photo_id)]
-                target = int(board_id)
+                target = board_id_int
                 initial = feedback.get(str(photo_id))
                 initial_board_id = initial["initial_board_id"] if initial else photo["board_id"]
                 if target != initial_board_id:
