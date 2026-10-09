@@ -21,7 +21,7 @@ from .config import model_path, paths
 from .crop import _silhouette_mask
 from .db import connect, create_run, record_artifact, recover_stale_runs, set_run_worker, update_run
 from .export import export_board, safe_name
-from .ingest import MAX_PHOTOS_PER_BOARD, PROCESSING_VERSION, SHOT_LIMITS, group_limit_violations, group_scanned, ocr_runtime_status, read_image, scan_files
+from .ingest import MAX_PHOTOS_PER_BOARD, PROCESSING_VERSION, SHOT_LIMITS, STANDARD_BOARD_PHOTOS, group_limit_violations, group_scanned, ocr_runtime_status, read_image, scan_files
 from .retention import compact_archive, persist_manifest, prepare_archive
 
 try:
@@ -464,6 +464,8 @@ def create_app(root: Path) -> Flask:
                 "runtime": ocr_runtime,
                 "files_scanned": len(scanned),
                 "cards_detected": sum(1 for item in scanned if item.get("is_card")),
+                "expected_groups": sum(1 for item in scanned if item.get("is_card")),
+                "proposed_groups": len(groups),
                 "identifiers_extracted": sum(1 for item in scanned if item.get("identifier")),
                 "ocr_attempts": sum(1 for item in scanned if item.get("ocr_status") in {"read", "empty", "error"}),
                 "ocr_errors": [
@@ -535,6 +537,9 @@ def create_app(root: Path) -> Flask:
             conn.commit()
         card_count = sum(1 for item in scanned if item.get("is_card"))
         warning = " OCR/card detection found no card boundaries; review the group before editing." if card_count == 0 and scanned else ""
+        if card_count and len(groups) != card_count:
+            short_groups = sum(1 for group in groups if len(group) < STANDARD_BOARD_PHOTOS)
+            warning += f" Card/group review required: detected {card_count} inventory cards but proposed {len(groups)} groups ({short_groups} under six photos)."
         if not ocr_runtime.get("available"):
             warning += f" OCR unavailable ({ocr_runtime.get('error') or ocr_runtime.get('status')}); install/check Tesseract before relying on card identity."
         elif ocr_summary["cards_detected"] and not ocr_summary["identifiers_extracted"]:

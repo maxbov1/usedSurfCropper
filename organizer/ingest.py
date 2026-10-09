@@ -29,7 +29,7 @@ except ImportError:
     pass
 
 SUPPORTED = {".jpg", ".jpeg", ".png", ".heic"}
-PROCESSING_VERSION = "0.12.0-forward-card-identity"
+PROCESSING_VERSION = "0.13.0-card-count-first-grouping"
 MAX_PHOTOS_PER_BOARD = 7
 STANDARD_BOARD_PHOTOS = 6
 SHOT_LIMITS = {"full_board": 4, "side_profile": 1, "fin_detail": 1, "card": 1}
@@ -465,74 +465,112 @@ def scan_files(input_dir: Path) -> list[dict]:
 
 
 def group_scanned(files: list[dict]) -> list[list[dict]]:
-    """Group a capture-ordered batch using the known capture protocol.
-
-    A normal board session is six board views, optionally accompanied by one
-    identity card and one fin/detail view. A card belongs to the contiguous
-    session in which it was photographed; the next card closes that session.
-    Visual/ML signals do not choose an arbitrary timestamp-based cut point.
-    """
+    """Group photos with a card-count constraint and visual board clusters."""
     if not files:
         return []
-    groups: list[list[dict]] = []
-    current: list[dict] = []
-    for item in files:
-        has_card = any(photo.get("is_card") for photo in current)
-        card_closes_current = bool(current) and item.get("is_card") and not has_card
-        # A second card is the next session marker only after the current
-        # session already has its identity card. A late card therefore joins
-        # the preceding board instead of becoming a singleton group.
-        if current and item.get("is_card") and has_card:
-            groups.append(current)
-            current = []
-            has_card = False
-        # Six board views is the standard cardless session. A card arriving at
-        # this boundary is still allowed to join it as its identity anchor;
-        # another board view starts the next session.
-        elif current and not has_card and len(current) >= STANDARD_BOARD_PHOTOS and not item.get("is_card"):
-            groups.append(current)
-            current = []
-        if current and len(current) >= MAX_PHOTOS_PER_BOARD:
-            groups.append(current)
-            current = []
-        current.append(item)
-        if card_closes_current:
-            groups.append(current)
-            current = []
-            continue
-        if len(current) >= MAX_PHOTOS_PER_BOARD:
-            groups.append(current)
-            current = []
-    if current:
-        groups.append(current)
-    card_reconciled = _reassign_late_cards([group for group in groups if group])
-    visually_grouped = _split_by_board_similarity(card_reconciled)
-    return _enforce_shot_limits(visually_grouped)
+    cards = [item for item in files if item.get("is_card")]
+    board_photos = [item for item in files if not item.get("is_card")]
+    expected_groups = len(cards)
+    clusters = _cluster_board_photos(board_photos)
+    if expected_groups:
+        clusters = _reconcile_cluster_count(clusters, expected_groups)
+        groups = _match_cards_to_clusters(cards, clusters)
+    else:
+        groups = clusters
+    return _split_oversized_groups(groups)
 
 
-def _reassign_late_cards(groups: list[list[dict]]) -> list[list[dict]]:
-    """Move trailing identity cards onto the next board-similarity group.
+def _cluster_board_photos(photos: list[dict]) -> list[list[dict]]:
+    """Create visual board clusters without letting cards contaminate them."""
+    if not photos:
+        return []
+    clusters = _split_by_board_similarity([photos])
+    return _split_oversized_groups(clusters, include_card=False)
 
-    In this capture set the identity frame is consistently the first frame of
-    the next board session from the organizer's perspective, even when its
-    timestamp sorts immediately after the previous board's last angle. The
-    visual grouping has already produced the candidate sessions; this pass
-    corrects only that one-card positional offset.
-    """
-    working = [list(group) for group in groups]
-    for index, group in enumerate(working[:-1]):
-        cards = [item for item in group if item.get("is_card")]
-        if len(cards) != 1 or not group or group[-1] is not cards[0]:
+
+def _cluster_distance(left: list[dict], right: list[dict]) -> float:
+    return _median([
+        visual_distance(before, after)
+        for before in left[-LOCAL_NEIGHBOR_COUNT:]
+        for after in right[:LOCAL_NEIGHBOR_COUNT]
+    ])
+
+
+def _reconcile_cluster_count(clusters: list[list[dict]], expected: int) -> list[list[dict]]:
+    """Bring visual-cluster count toward the card-derived expected count."""
+    working = [list(cluster) for cluster in clusters if cluster]
+    while len(working) < expected and working:
+        index = max(range(len(working)), key=lambda candidate: len(working[candidate]))
+        cluster = working[index]
+        if len(cluster) < 2:
+            break
+        cut = max(1, len(cluster) // 2)
+        working[index:index + 1] = [cluster[:cut], cluster[cut:]]
+    while len(working) > expected:
+        candidates = [
+            (_cluster_distance(working[index], working[index + 1]), index)
+            for index in range(len(working) - 1)
+            if len(working[index]) + len(working[index + 1]) <= STANDARD_BOARD_PHOTOS
+        ]
+        if not candidates:
+            break
+        _, index = min(candidates, key=lambda candidate: candidate[0])
+        working[index:index + 2] = [working[index] + working[index + 1]]
+    return working
+
+
+def _cluster_time_center(cluster: list[dict]) -> float | None:
+    captures = [value for value in (_capture_seconds(item) for item in cluster) if value is not None]
+    return sum(captures) / len(captures) if captures else None
+
+
+def _card_cluster_score(card: dict, cluster: list[dict]) -> float:
+    visual = card_visual_affinity(card, cluster)
+    if visual is None:
+        visual = 0.5
+    card_time, cluster_time = _capture_seconds(card), _cluster_time_center(cluster)
+    temporal = 0.0 if card_time is None or cluster_time is None else min(abs(card_time - cluster_time) / LOCAL_TIME_WINDOW_SECONDS, 4.0) * 0.01
+    return visual + temporal
+
+
+def _match_cards_to_clusters(cards: list[dict], clusters: list[list[dict]]) -> list[list[dict]]:
+    """Assign each detected card to one visual cluster, one-to-one."""
+    if not clusters:
+        return [[card] for card in cards]
+    assignments: dict[int, int] = {}
+    pairs = sorted(
+        (_card_cluster_score(card, cluster), card_index, cluster_index)
+        for card_index, card in enumerate(cards)
+        for cluster_index, cluster in enumerate(clusters)
+    )
+    used_cards: set[int] = set()
+    used_clusters: set[int] = set()
+    for _, card_index, cluster_index in pairs:
+        if card_index in used_cards or cluster_index in used_clusters:
             continue
-        following = working[index + 1]
-        if any(item.get("is_card") for item in following):
-            continue
-        before = [item for item in group if not item.get("is_card")]
-        if len(following) + 1 > MAX_PHOTOS_PER_BOARD:
-            continue
-        working[index] = before
-        working[index + 1] = [cards[0], *following]
-    return [group for group in working if group]
+        assignments[cluster_index] = card_index
+        used_cards.add(card_index)
+        used_clusters.add(cluster_index)
+    groups = []
+    for cluster_index, cluster in enumerate(clusters):
+        card_index = assignments.get(cluster_index)
+        groups.append(([cards[card_index]] if card_index is not None else []) + list(cluster))
+    groups.extend([cards[index:index + 1] for index in range(len(cards)) if index not in used_cards])
+    return groups
+
+
+def _split_oversized_groups(groups: list[list[dict]], include_card: bool = True) -> list[list[dict]]:
+    """Apply only the physical seven-photo cap; shot types remain review data."""
+    limited: list[list[dict]] = []
+    limit = MAX_PHOTOS_PER_BOARD if include_card else STANDARD_BOARD_PHOTOS
+    for group in groups:
+        remaining = list(group)
+        while len(remaining) > limit:
+            limited.append(remaining[:limit])
+            remaining = remaining[limit:]
+        if remaining:
+            limited.append(remaining)
+    return limited
 
 
 def _split_by_board_similarity(groups: list[list[dict]]) -> list[list[dict]]:
@@ -553,7 +591,7 @@ def _split_by_board_similarity(groups: list[list[dict]]) -> list[list[dict]]:
         for index in range(1, len(photos)):
             left_context = _local_context(photos, index, -1)
             right_context = _local_context(photos, index, 1)
-            if len(left_context) < 2 or len(right_context) < 2:
+            if index < 4 or len(photos) - index < 4 or len(left_context) < 2 or len(right_context) < 2:
                 continue
             across = _context_distance(left_context, right_context)
             within = max(_context_cohesion(left_context), _context_cohesion(right_context))

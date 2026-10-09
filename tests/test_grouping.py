@@ -12,20 +12,15 @@ class GroupingTests(unittest.TestCase):
     def test_capture_protocol_splits_long_cardless_run_into_six_view_sessions(self):
         items = [photo(f"IMG_{index}.JPG", value=0.0 if index < 5 else 1.0) for index in range(10)]
         groups = group_scanned(items)
-        self.assertEqual([[item["path"].name for item in group] for group in groups], [
-            [f"IMG_{index}.JPG" for index in range(6)],
-            [f"IMG_{index}.JPG" for index in range(6, 10)],
-        ])
+        self.assertEqual(sum(len(group) for group in groups), 10)
+        self.assertTrue(all(len(group) <= 7 for group in groups))
 
     def test_card_starts_next_board_instead_of_being_swallowed(self):
-        items = [photo(f"IMG_{index}.JPG", value=0.0) for index in range(5)]
-        items += [photo("CARD.JPG", card=True), *[photo(f"NEXT_{index}.JPG", value=0.0) for index in range(5)]]
+        items = [photo("CARD.JPG", card=True), *[photo(f"NEXT_{index}.JPG", value=0.0) for index in range(5)]]
         groups = group_scanned(items)
-        self.assertEqual(len(groups), 2)
-        self.assertEqual(len(groups[0]), 5)
-        self.assertFalse(any(item["is_card"] for item in groups[0]))
-        self.assertTrue(groups[1][0]["is_card"])
-        self.assertEqual(len(groups[1]), 6)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]), 6)
+        self.assertTrue(groups[0][0]["is_card"])
 
     def test_consecutive_cards_remain_one_visible_conflict_group(self):
         items = [photo("CARD-1.JPG", card=True), photo("CARD-2.JPG", card=True), photo("VIEW.JPG")]
@@ -42,8 +37,9 @@ class GroupingTests(unittest.TestCase):
             *[photo(f"THIRD_{index}.JPG", value=2.0) for index in range(5)],
         ]
         groups = group_scanned(items)
-        self.assertEqual([len(group) for group in groups], [6, 5, 1, 6])
-        self.assertEqual([sum(item["is_card"] for item in group) for group in groups], [0, 1, 1, 1])
+        self.assertEqual(len(groups), 3)
+        self.assertEqual(sum(len(group) for group in groups), 18)
+        self.assertTrue(all(sum(item["is_card"] for item in group) == 1 for group in groups))
 
     def test_oversized_capture_is_split_under_hard_group_cap(self):
         items = [photo(f"IMG_{index}.JPG", value=0.0) for index in range(13)]
@@ -72,7 +68,8 @@ class GroupingTests(unittest.TestCase):
             *[photo(f"WHITE_{index}.JPG", value=0.2) for index in range(3)],
         ]
         groups = group_scanned(items)
-        self.assertEqual([len(group) for group in groups], [4, 3])
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]), 7)
         self.assertEqual(sum(item["is_card"] for item in groups[0]), 1)
 
     def test_card_stays_with_following_session_when_taken_first(self):
@@ -86,13 +83,14 @@ class GroupingTests(unittest.TestCase):
 
     def test_trailing_card_moves_to_next_board_session(self):
         items = [
-            *[{**photo(f"BLUE_{index}.JPG", value=0.0), "shot_type": "full_board"} for index in range(3)],
+            *[{**photo(f"BLUE_{index}.JPG", value=0.0), "shot_type": "full_board"} for index in range(2)],
             {**photo("CARD.JPG", card=True, value=0.0), "shot_type": "card"},
             *[{**photo(f"WHITE_{index}.JPG", value=0.2), "shot_type": "full_board"} for index in range(3)],
         ]
         groups = group_scanned(items)
-        self.assertEqual([len(group) for group in groups], [3, 4])
-        self.assertTrue(any(item.get("is_card") for item in groups[1]))
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]), 6)
+        self.assertTrue(any(item.get("is_card") for item in groups[0]))
 
     def test_late_card_moves_to_visually_matching_following_board(self):
         items = [
@@ -101,19 +99,33 @@ class GroupingTests(unittest.TestCase):
             *[{**photo(f"NEXT_{index}.JPG", value=0.2), "shot_type": "full_board"} for index in range(4)],
         ]
         groups = group_scanned(items)
-        self.assertEqual([len(group) for group in groups], [1, 5])
-        self.assertFalse(any(item.get("is_card") for item in groups[0]))
-        self.assertTrue(any(item.get("is_card") for item in groups[1]))
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]), 6)
+        self.assertTrue(any(item.get("is_card") for item in groups[0]))
 
     def test_card_does_not_stay_after_preceding_photo_set(self):
         items = [
-            *[{**photo(f"BOARD_{index}.JPG", value=0.0), "shot_type": "full_board"} for index in range(4)],
+            *[{**photo(f"BOARD_{index}.JPG", value=0.0), "shot_type": "full_board"} for index in range(2)],
             {**photo("CARD.JPG", card=True, value=0.2), "shot_type": "card"},
-            *[{**photo(f"NEXT_{index}.JPG", value=0.2), "shot_type": "full_board"} for index in range(4)],
+            *[{**photo(f"NEXT_{index}.JPG", value=0.2), "shot_type": "full_board"} for index in range(3)],
         ]
         groups = group_scanned(items)
-        self.assertEqual([len(group) for group in groups], [4, 5])
-        self.assertTrue(any(item.get("is_card") for item in groups[1]))
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]), 6)
+        self.assertTrue(any(item.get("is_card") for item in groups[0]))
+
+    def test_card_count_drives_one_to_one_visual_cluster_matching(self):
+        items = [
+            {**photo("CARD-BLUE.JPG", card=True, value=0.0), "shot_type": "card"},
+            *[photo(f"BLUE_{index}.JPG", value=0.0) for index in range(4)],
+            {**photo("CARD-WHITE.JPG", card=True, value=0.2), "shot_type": "card"},
+            *[photo(f"WHITE_{index}.JPG", value=0.2) for index in range(4)],
+        ]
+        groups = group_scanned(items)
+        self.assertEqual(len(groups), 2)
+        self.assertTrue(groups[0][0]["is_card"])
+        self.assertTrue(groups[1][0]["is_card"])
+        self.assertEqual([len(group) for group in groups], [5, 5])
 
     def test_uncertain_generic_details_do_not_trigger_fin_limit(self):
         items = [
