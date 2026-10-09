@@ -351,6 +351,11 @@ def rotated_crop_proposal(image: Image.Image, shot_type: str = "auto", padding: 
         return {"image": image, "crop": base_crop[:4], "shot_type": resolved_type, "angle": 0.0, "rotation_applied": False, "review": bool(classification.get("review", False)), "reason": f"board already nearly upright; {base_crop[4]}"}
     rotated = image.rotate(angle, expand=True, resample=Image.Resampling.BICUBIC)
     rotated_crop = _rotate_rect(base_crop[:4], image.size, rotated.size, angle)
+    if resolved_type == "full_board" and isinstance(classification.get("opencv_boundary"), (tuple, list)):
+        boundary = tuple(classification["opencv_boundary"])
+        if len(boundary) == 4:
+            rotated_boundary = _rotate_rect(boundary, image.size, rotated.size, angle)
+            rotated_crop = _equal_vertical_padding_crop(rotated_crop, rotated_boundary, rotated.size)
     if not _crop_is_source_valid(image.size, angle, rotated.size, rotated_crop):
         return {"image": image, "crop": base_crop[:4], "shot_type": resolved_type, "angle": 0.0, "attempted_angle": round(angle, 3), "rotation_applied": False, "review": True, "reason": f"rotation not applied; source crop kept; {base_crop[4]}"}
     return {"image": rotated, "crop": rotated_crop, "shot_type": resolved_type, "angle": round(angle, 3), "rotation_applied": True, "review": bool(classification.get("review", False)), "reason": f"OpenCV crop + padding before final board-axis rotation; {base_crop[4]}"}
@@ -373,6 +378,17 @@ def _rotate_rect(crop: tuple[int, int, int, int], source_size: tuple[int, int], 
     xs = [point[0] for point in transformed]
     ys = [point[1] for point in transformed]
     return _clamp_crop(round(min(xs)), round(min(ys)), round(max(xs) - min(xs)), round(max(ys) - min(ys)), rotated_width, rotated_height)
+
+
+def _equal_vertical_padding_crop(crop: tuple[int, int, int, int], boundary: tuple[int, int, int, int], image_size: tuple[int, int]) -> tuple[int, int, int, int]:
+    """Force equal board-axis padding above and below a full-board crop."""
+    crop_x, _, crop_width, _ = crop
+    boundary_x, boundary_y, boundary_width, boundary_height = boundary
+    image_width, image_height = image_size
+    requested = max(0, min(crop[1] - boundary_y, (crop[1] + crop[3]) - (boundary_y + boundary_height)))
+    available = min(boundary_y, max(0, image_height - (boundary_y + boundary_height)))
+    padding = min(requested, available)
+    return _clamp_crop(crop_x, boundary_y - padding, crop_width, boundary_height + 2 * padding, image_width, image_height)
 
 
 def estimate_board_angle(image: Image.Image, shot_type: str) -> float:

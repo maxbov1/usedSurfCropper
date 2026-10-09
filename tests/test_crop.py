@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from organizer.crop import _complete_profile_yolo_box, _usable_yolo_box, shared_full_board_padding, suggested_crop
+from organizer.crop import _complete_profile_yolo_box, _equal_vertical_padding_crop, _usable_yolo_box, shared_full_board_padding, suggested_crop
 
 
 class CropHandoffTests(unittest.TestCase):
@@ -56,6 +56,10 @@ class CropHandoffTests(unittest.TestCase):
         padding = shared_full_board_padding(cases)
         self.assertTrue(padding["available"])
         self.assertAlmostEqual(padding["vertical"], 0.066666, places=4)
+
+    def test_rotated_full_board_crop_has_equal_nose_and_tail_padding(self):
+        crop = _equal_vertical_padding_crop((50, 150, 400, 1100), (100, 200, 300, 1000), (500, 1600))
+        self.assertEqual(crop[1] - 200, (200 + 1000) - (crop[1] + crop[3]))
 
 
 if __name__ == "__main__":
