@@ -72,6 +72,26 @@ class GroupingTests(unittest.TestCase):
         groups = group_scanned(items)
         self.assertEqual([len(group) for group in groups], [4, 3])
 
+    def test_card_affinity_keeps_card_with_matching_board_side(self):
+        items = [
+            {**photo("CARD.JPG", card=True, value=0.0), "shot_type": "card"},
+            *[{**photo(f"BLUE_{index}.JPG", value=0.0), "shot_type": "full_board"} for index in range(3)],
+            *[{**photo(f"WHITE_{index}.JPG", value=0.2), "shot_type": "full_board"} for index in range(3)],
+        ]
+        groups = group_scanned(items)
+        self.assertEqual([len(group) for group in groups], [4, 3])
+        self.assertTrue(any(item.get("is_card") for item in groups[0]))
+
+    def test_card_affinity_can_move_late_card_to_matching_side(self):
+        items = [
+            *[{**photo(f"BLUE_{index}.JPG", value=0.0), "shot_type": "full_board"} for index in range(3)],
+            {**photo("CARD.JPG", card=True, value=0.2), "shot_type": "card"},
+            *[{**photo(f"WHITE_{index}.JPG", value=0.2), "shot_type": "full_board"} for index in range(3)],
+        ]
+        groups = group_scanned(items)
+        self.assertEqual([len(group) for group in groups], [3, 4])
+        self.assertTrue(any(item.get("is_card") for item in groups[1]))
+
     def test_uncertain_generic_details_do_not_trigger_fin_limit(self):
         items = [
             {**photo("DETAIL-1.JPG"), "shot_type": "detail"},

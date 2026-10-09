@@ -29,11 +29,12 @@ except ImportError:
     pass
 
 SUPPORTED = {".jpg", ".jpeg", ".png", ".heic"}
-PROCESSING_VERSION = "0.5.0-visual-group-boundaries"
+PROCESSING_VERSION = "0.6.0-card-anchored-grouping"
 MAX_PHOTOS_PER_BOARD = 7
 PREFERRED_PHOTOS_PER_BOARD = 6
 SHOT_LIMITS = {"full_board": 4, "side_profile": 1, "fin_detail": 1, "card": 1}
 VISUAL_HARD_BOUNDARY = 0.10
+CARD_AFFINITY_GAP = 0.045
 
 
 def visual_signature(image: Image.Image) -> tuple[float, ...]:
@@ -73,6 +74,25 @@ def visual_distance(left: dict, right: dict) -> float:
         return 0.0
     a, b = np.asarray(first, dtype=np.float32), np.asarray(second, dtype=np.float32)
     return float(np.mean(np.abs(a - b)))
+
+
+def card_visual_affinity(card: dict, photos: list[dict]) -> float | None:
+    """Return the card's visual distance to the closest board-photo cluster.
+
+    OCR remains the authoritative source for SKU/model/brand. This is the
+    visual companion signal: cards often show the board and its identifying
+    details in the same frame, so a card should help choose between adjacent
+    board-photo clusters even when capture timestamps are misleading.
+    """
+    distances = sorted(
+        visual_distance(card, photo)
+        for photo in photos
+        if not photo.get("is_card") and photo.get("visual_signature")
+    )
+    if not distances:
+        return None
+    nearest = distances[: min(3, len(distances))]
+    return sum(nearest) / len(nearest)
 
 
 def sha256(path: Path) -> str:
@@ -474,7 +494,8 @@ def group_scanned(files: list[dict]) -> list[list[dict]]:
         groups.append(pending_cards)
     reconciled = _reconcile_late_card_groups([group for group in groups if group])
     visually_partitioned = _split_visual_boundaries(reconciled)
-    return _enforce_shot_limits(visually_partitioned)
+    card_anchored = _split_card_anchor_mismatches(visually_partitioned)
+    return _enforce_shot_limits(card_anchored)
 
 
 def _split_visual_boundaries(groups: list[list[dict]]) -> list[list[dict]]:
@@ -496,6 +517,51 @@ def _split_visual_boundaries(groups: list[list[dict]]) -> list[list[dict]]:
                 start = index
         if start < len(group):
             partitioned.append(group[start:])
+    return [group for group in partitioned if group]
+
+
+def _split_card_anchor_mismatches(groups: list[list[dict]]) -> list[list[dict]]:
+    """Keep a card with the visually matching side of a mixed board group.
+
+    A card is an identity anchor, but its yellow/card layout is not itself a
+    hard board boundary. We therefore look for a sustained affinity jump in
+    the surrounding non-card sequence. This catches a blue board followed by
+    a white board inside one timestamp bucket without splitting ordinary
+    lighting/angle changes.
+    """
+    partitioned: list[list[dict]] = []
+    for group in groups:
+        cards = [item for item in group if item.get("is_card")]
+        photos = [item for item in group if not item.get("is_card")]
+        if len(cards) != 1 or len(photos) < 4:
+            partitioned.append(group)
+            continue
+        card = cards[0]
+        affinities = [visual_distance(card, photo) for photo in photos]
+        candidates = []
+        for cut in range(2, len(photos) - 1):
+            left = affinities[:cut]
+            right = affinities[cut:]
+            left_mean = sum(left) / len(left)
+            right_mean = sum(right) / len(right)
+            gap = abs(left_mean - right_mean)
+            if gap >= CARD_AFFINITY_GAP:
+                candidates.append((gap, cut, left_mean, right_mean))
+        if not candidates:
+            partitioned.append(group)
+            continue
+        _, cut, _, _ = max(candidates, key=lambda value: value[0])
+        left_photos, right_photos = photos[:cut], photos[cut:]
+        left_affinity = card_visual_affinity(card, left_photos)
+        right_affinity = card_visual_affinity(card, right_photos)
+        if left_affinity is None or right_affinity is None:
+            partitioned.append(group)
+            continue
+        matching_side = "left" if left_affinity <= right_affinity else "right"
+        if matching_side == "left":
+            partitioned.extend([left_photos + [card], right_photos])
+        else:
+            partitioned.extend([left_photos, [card] + right_photos])
     return [group for group in partitioned if group]
 
 
