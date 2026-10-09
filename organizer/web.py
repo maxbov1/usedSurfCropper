@@ -731,6 +731,10 @@ def create_app(root: Path) -> Flask:
                 ocr_status.update(json.loads(ocr_status_path.read_text()))
             except (OSError, json.JSONDecodeError):
                 ocr_status["runtime"] = {"available": False, "status": "status_unreadable"}
+        # The persisted report describes the interpreter used for the last
+        # grouping pass. Replace only its runtime probe with the interpreter
+        # serving this page so an old failure cannot masquerade as current.
+        ocr_status["runtime"] = ocr_runtime_status()
         return render_template("shuffleboard.html", boards=boards, photos=photo_data, predictions=predictions, retest=retest, retest_mode=retest_mode, retest_name=retest_path.name if retest_path else "", grouping_run_id=grouping_run_id, max_photos_per_board=MAX_PHOTOS_PER_BOARD, shot_limits=SHOT_LIMITS, oversized_groups=oversized_groups, composition_violations=composition_violations, ocr_status=ocr_status, identity_missing=identity_missing)
 
     @app.post("/shuffleboard/save")
