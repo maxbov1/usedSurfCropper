@@ -29,11 +29,13 @@ except ImportError:
     pass
 
 SUPPORTED = {".jpg", ".jpeg", ".png", ".heic"}
-PROCESSING_VERSION = "0.10.0-board-similarity-grouping"
+PROCESSING_VERSION = "0.11.0-local-board-neighborhoods"
 MAX_PHOTOS_PER_BOARD = 7
 STANDARD_BOARD_PHOTOS = 6
 SHOT_LIMITS = {"full_board": 4, "side_profile": 1, "fin_detail": 1, "card": 1}
 BOARD_SIMILARITY_BOUNDARY = 0.10
+LOCAL_NEIGHBOR_COUNT = 8
+LOCAL_TIME_WINDOW_SECONDS = 10 * 60
 
 
 def visual_signature(image: Image.Image) -> tuple[float, ...]:
@@ -42,8 +44,8 @@ def visual_signature(image: Image.Image) -> tuple[float, ...]:
     This is deliberately not a board recognizer. In this controlled room the
     center of the frame carries enough board color/shape information to catch
     an obvious board change while remaining tolerant of light versus low-light
-    paired views. It is only used as supporting evidence around timestamp/card
-    boundaries.
+    paired views. It is compared within a small capture-time neighborhood,
+    not against the entire batch.
     """
     if cv2 is None or np is None:
         return ()
@@ -86,6 +88,54 @@ def card_visual_affinity(card: dict, photos: list[dict]) -> float | None:
         return None
     nearest = distances[: min(3, len(distances))]
     return sum(nearest) / len(nearest)
+
+
+def _capture_seconds(item: dict) -> float | None:
+    capture = item.get("capture")
+    if not capture:
+        return None
+    try:
+        return datetime.fromisoformat(str(capture)).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _local_context(photos: list[dict], boundary: int, direction: int) -> list[dict]:
+    """Return up to eight nearby photos on one side of a proposed boundary."""
+    if direction < 0:
+        candidates = list(reversed(photos[max(0, boundary - LOCAL_NEIGHBOR_COUNT):boundary]))
+    else:
+        candidates = photos[boundary:min(len(photos), boundary + LOCAL_NEIGHBOR_COUNT)]
+    anchor = _capture_seconds(photos[boundary - 1] if direction < 0 else photos[boundary])
+    if anchor is None:
+        return candidates
+    return [
+        item for item in candidates
+        if (item_capture := _capture_seconds(item)) is None
+        or abs(item_capture - anchor) <= LOCAL_TIME_WINDOW_SECONDS
+    ]
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _context_distance(left: list[dict], right: list[dict]) -> float:
+    return _median([visual_distance(before, after) for before in left for after in right])
+
+
+def _context_cohesion(context: list[dict]) -> float:
+    return _median([
+        visual_distance(context[left], context[right])
+        for left in range(len(context))
+        for right in range(left + 1, len(context))
+    ])
 
 
 def sha256(path: Path) -> str:
@@ -473,13 +523,21 @@ def _split_by_board_similarity(groups: list[list[dict]]) -> list[list[dict]]:
         if len(cards) > 1 or len(photos) < 4:
             partitioned.append(group)
             continue
-        boundaries = [
-            index
-            for index in range(1, len(photos))
-            if index >= 2
-            and len(photos) - index >= 2
-            and visual_distance(photos[index - 1], photos[index]) >= BOARD_SIMILARITY_BOUNDARY
-        ]
+        candidates: list[tuple[float, int]] = []
+        for index in range(1, len(photos)):
+            left_context = _local_context(photos, index, -1)
+            right_context = _local_context(photos, index, 1)
+            if len(left_context) < 2 or len(right_context) < 2:
+                continue
+            across = _context_distance(left_context, right_context)
+            within = max(_context_cohesion(left_context), _context_cohesion(right_context))
+            if across >= BOARD_SIMILARITY_BOUNDARY and across - within >= BOARD_SIMILARITY_BOUNDARY / 2:
+                candidates.append((across - within, index))
+        boundaries: list[int] = []
+        for _, index in sorted(candidates, reverse=True):
+            if all(abs(index - selected) >= 2 for selected in boundaries):
+                boundaries.append(index)
+        boundaries.sort()
         if not boundaries:
             partitioned.append(group)
             continue
