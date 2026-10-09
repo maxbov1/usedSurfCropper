@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from organizer.ingest import group_scanned
+from organizer.ingest import group_limit_violations, group_scanned
 
 
 def photo(name, card=False, value=0.0):
@@ -28,8 +28,7 @@ class GroupingTests(unittest.TestCase):
     def test_consecutive_cards_remain_one_visible_conflict_group(self):
         items = [photo("CARD-1.JPG", card=True), photo("CARD-2.JPG", card=True), photo("VIEW.JPG")]
         groups = group_scanned(items)
-        self.assertEqual(len(groups), 1)
-        self.assertEqual(sum(item["is_card"] for item in groups[0]), 2)
+        self.assertEqual([sum(item["is_card"] for item in group) for group in groups], [1, 1])
 
     def test_late_card_block_is_reconciled_into_cardless_neighbors(self):
         items = [
@@ -49,7 +48,20 @@ class GroupingTests(unittest.TestCase):
         items = [photo(f"IMG_{index}.JPG", value=0.0) for index in range(13)]
         groups = group_scanned(items)
         self.assertEqual(sum(len(group) for group in groups), 13)
-        self.assertTrue(all(len(group) <= 8 for group in groups))
+        self.assertTrue(all(len(group) <= 7 for group in groups))
+
+    def test_shot_limits_split_duplicate_fin_details(self):
+        items = [
+            {**photo("CARD.JPG", card=True), "shot_type": "card"},
+            *[{**photo(f"FULL_{index}.JPG"), "shot_type": "full_board"} for index in range(4)],
+            {**photo("PROFILE.JPG"), "shot_type": "side_profile"},
+            {**photo("FIN-1.JPG"), "shot_type": "fin_detail"},
+            {**photo("FIN-2.JPG"), "shot_type": "fin_detail"},
+        ]
+        groups = group_scanned(items)
+        self.assertEqual([len(group) for group in groups], [7, 1])
+        self.assertEqual(group_limit_violations(groups[0]), {})
+        self.assertEqual(group_limit_violations(groups[1]), {})
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ from .config import model_path, paths
 from .crop import _silhouette_mask
 from .db import connect, create_run, record_artifact, recover_stale_runs, set_run_worker, update_run
 from .export import export_board, safe_name
-from .ingest import MAX_PHOTOS_PER_BOARD, PROCESSING_VERSION, group_scanned, ocr_runtime_status, read_image, scan_files
+from .ingest import MAX_PHOTOS_PER_BOARD, PROCESSING_VERSION, SHOT_LIMITS, group_limit_violations, group_scanned, ocr_runtime_status, read_image, scan_files
 from .retention import compact_archive, persist_manifest, prepare_archive
 
 try:
@@ -398,6 +398,20 @@ def create_app(root: Path) -> Flask:
             create_run(conn, group_run_id, "grouping", pipeline_version=PROCESSING_VERSION,
                        input_signature=signature, metadata={"input_count": active_count}, status="running")
         scanned = scan_files(directories["input"])
+        # Shot composition is part of grouping constraints, not only crop
+        # presentation. Reuse the same classifier before partitioning so a
+        # second fin/detail cannot silently enter an otherwise valid group.
+        from .crop import classify_shot
+        for item in scanned:
+            if "error" in item or item.get("is_card"):
+                item["shot_type"] = "card" if item.get("is_card") else ""
+                continue
+            try:
+                image, _ = read_image(item["path"])
+                classification = classify_shot(image)
+                item["shot_type"] = str(classification.get("shot_type", "")) if classification.get("confidence", 0) else ""
+            except Exception:
+                item["shot_type"] = ""
         with db() as conn:
             excluded = {row["source_path"] for row in conn.execute("SELECT source_path FROM excluded_sources")}
             current_sources = {str(item["path"].relative_to(root)) for item in scanned if "error" not in item}
@@ -497,11 +511,11 @@ def create_app(root: Path) -> Flask:
                         # A rerun with the OCR-enabled environment refreshes
                         # prior blank card predictions without touching human
                         # grouping/crop corrections.
-                        conn.execute("UPDATE photos SET source_is_card=?, ocr_text=CASE WHEN ? <> '' THEN ? ELSE ocr_text END, card_fins_included=CASE WHEN ? <> '' THEN ? ELSE card_fins_included END, card_fin_system=CASE WHEN ? <> '' THEN ? ELSE card_fin_system END WHERE id=?", (int(item["is_card"]), item["ocr"], item["ocr"], item.get("identifier", {}).get("fins_included", ""), item.get("identifier", {}).get("fins_included", ""), item.get("identifier", {}).get("fin_system", ""), item.get("identifier", {}).get("fin_system", ""), old["id"]))
+                        conn.execute("UPDATE photos SET source_is_card=?, shot_type=CASE WHEN ? <> '' THEN ? ELSE shot_type END, ocr_text=CASE WHEN ? <> '' THEN ? ELSE ocr_text END, card_fins_included=CASE WHEN ? <> '' THEN ? ELSE card_fins_included END, card_fin_system=CASE WHEN ? <> '' THEN ? ELSE card_fin_system END WHERE id=?", (int(item["is_card"]), item.get("shot_type", ""), item.get("shot_type", ""), item["ocr"], item["ocr"], item.get("identifier", {}).get("fins_included", ""), item.get("identifier", {}).get("fins_included", ""), item.get("identifier", {}).get("fin_system", ""), item.get("identifier", {}).get("fin_system", ""), old["id"]))
                         continue
                     # Grouping is deliberately separate from cropping. Keep a
                     # full-frame placeholder until this group is approved.
-                    shot = "card" if item["is_card"] else "unclassified"
+                    shot = item.get("shot_type") or ("card" if item["is_card"] else "unclassified")
                     conn.execute("INSERT INTO photos(board_id, source_path, content_hash, capture_time, width, height, shot_type, original_prediction, crop_x, crop_y, crop_w, crop_h, source_is_card, ocr_text, card_fins_included, card_fin_system) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (board_id, source_path, item["hash"], item["capture"], item["width"], item["height"], shot, "grouping only; crop not run", 0, 0, item["width"], item["height"], int(item["is_card"]), item["ocr"], item.get("identifier", {}).get("fins_included", ""), item.get("identifier", {}).get("fin_system", "")))
             conn.execute("INSERT OR REPLACE INTO grouping_feedback_batches(run_id, input_signature, pipeline_version, created_at, status) VALUES (?,?,?,?,?)", (group_run_id, signature, PROCESSING_VERSION, datetime.now().isoformat(timespec="seconds"), "proposed"))
             for source_path, initial in initial_grouping.items():
@@ -701,6 +715,11 @@ def create_app(root: Path) -> Flask:
         for photo in photo_data:
             group_counts[str(photo["board_id"])] = group_counts.get(str(photo["board_id"]), 0) + 1
         oversized_groups = {group_id: count for group_id, count in group_counts.items() if count > MAX_PHOTOS_PER_BOARD}
+        composition_violations = {
+            str(board["id"]): group_limit_violations([photo for photo in photo_data if str(photo["board_id"]) == str(board["id"])])
+            for board in boards
+        }
+        composition_violations = {board_id: violations for board_id, violations in composition_violations.items() if violations}
         identity_missing = bool(photo_data) and bool(boards) and all(
             not any(board[name] for name in ("sku", "shaper", "model") if name in board.keys())
             for board in boards
@@ -712,7 +731,7 @@ def create_app(root: Path) -> Flask:
                 ocr_status.update(json.loads(ocr_status_path.read_text()))
             except (OSError, json.JSONDecodeError):
                 ocr_status["runtime"] = {"available": False, "status": "status_unreadable"}
-        return render_template("shuffleboard.html", boards=boards, photos=photo_data, predictions=predictions, retest=retest, retest_mode=retest_mode, retest_name=retest_path.name if retest_path else "", grouping_run_id=grouping_run_id, max_photos_per_board=MAX_PHOTOS_PER_BOARD, oversized_groups=oversized_groups, ocr_status=ocr_status, identity_missing=identity_missing)
+        return render_template("shuffleboard.html", boards=boards, photos=photo_data, predictions=predictions, retest=retest, retest_mode=retest_mode, retest_name=retest_path.name if retest_path else "", grouping_run_id=grouping_run_id, max_photos_per_board=MAX_PHOTOS_PER_BOARD, shot_limits=SHOT_LIMITS, oversized_groups=oversized_groups, composition_violations=composition_violations, ocr_status=ocr_status, identity_missing=identity_missing)
 
     @app.post("/shuffleboard/save")
     def save_shuffleboard():
@@ -750,7 +769,7 @@ def create_app(root: Path) -> Flask:
                 set_run_worker(conn, run_id, pid=worker.pid, log_path=str(crop_log.relative_to(root)))
             return jsonify({"ok": True, "moved": len(saved), "retest": True, "crop_run": run_id, "redirect": url_for("annotate", set="true", run=run_id)})
         with db() as conn:
-            allowed_photos = {str(row["id"]): row for row in conn.execute("SELECT id, board_id FROM photos WHERE source_path LIKE 'input/%'")}
+            allowed_photos = {str(row["id"]): row for row in conn.execute("SELECT id, board_id, shot_type, source_is_card FROM photos WHERE source_path LIKE 'input/%'")}
             allowed_boards = {row["id"] for row in conn.execute("SELECT id FROM boards")}
             new_board_ids = {str(value) for value in (payload.get("new_board_ids") or [])}
             new_board_map = {}
@@ -774,6 +793,26 @@ def create_app(root: Path) -> Flask:
                 str(photo_id): new_board_map.get(str(board_id), board_id)
                 for photo_id, board_id in final_assignments.items()
             }
+            groups_for_validation: dict[int, list[dict]] = {}
+            for photo_id, photo in allowed_photos.items():
+                try:
+                    board_id = int(normalized_assignments.get(photo_id, photo["board_id"]))
+                except (TypeError, ValueError):
+                    continue
+                groups_for_validation.setdefault(board_id, []).append(dict(photo))
+            composition_violations = {
+                board_id: group_limit_violations(items)
+                for board_id, items in groups_for_validation.items()
+                if group_limit_violations(items)
+            }
+            if composition_violations:
+                labels = []
+                for board_id, violations in composition_violations.items():
+                    limits = {"total": MAX_PHOTOS_PER_BOARD, **SHOT_LIMITS}
+                    details = ", ".join(f"{bucket.replace('_', ' ')}={count} (up to {limits.get(bucket, count)})" for bucket, count in violations.items())
+                    labels.append(f"group {board_id}: {details}")
+                conn.rollback()
+                return jsonify({"error": "Split groups to respect shot limits: " + " · ".join(labels)}), 400
             counts = {}
             for photo_id, board_id in normalized_assignments.items():
                 if photo_id in allowed_photos:

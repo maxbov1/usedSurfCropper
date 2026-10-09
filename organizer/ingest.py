@@ -30,8 +30,9 @@ except ImportError:
 
 SUPPORTED = {".jpg", ".jpeg", ".png", ".heic"}
 PROCESSING_VERSION = "0.4.0-late-card-reconciliation"
-MAX_PHOTOS_PER_BOARD = 8
+MAX_PHOTOS_PER_BOARD = 7
 PREFERRED_PHOTOS_PER_BOARD = 6
+SHOT_LIMITS = {"full_board": 4, "side_profile": 1, "fin_detail": 1, "detail": 1, "card": 1}
 
 
 def visual_signature(image: Image.Image) -> tuple[float, ...]:
@@ -462,15 +463,55 @@ def group_scanned(files: list[dict]) -> list[list[dict]]:
         # close early for a possible seventh fins/detail shot; the next card
         # or the max-size guard below will resolve it.
         if len(current) > MAX_PHOTOS_PER_BOARD and sum(item.get("is_card", False) for item in current) <= 1:
-            groups.append(current[:PREFERRED_PHOTOS_PER_BOARD])
-            cardless = current[PREFERRED_PHOTOS_PER_BOARD:]
+            groups.append(current[:MAX_PHOTOS_PER_BOARD])
+            cardless = current[MAX_PHOTOS_PER_BOARD:]
             current = []
     groups.extend(split_cardless(cardless))
     if current:
         groups.append(current)
     if pending_cards:
         groups.append(pending_cards)
-    return _reconcile_late_card_groups([group for group in groups if group])
+    reconciled = _reconcile_late_card_groups([group for group in groups if group])
+    return _enforce_shot_limits(reconciled)
+
+
+def shot_bucket(item: dict) -> str | None:
+    """Map a scanned/database photo to the composition bucket it consumes."""
+    if item.get("is_card") or item.get("source_is_card"):
+        return "card"
+    shot_type = str(item.get("shot_type") or "").lower()
+    if shot_type in SHOT_LIMITS:
+        return shot_type
+    return None
+
+
+def group_limit_violations(items: list[dict]) -> dict[str, int]:
+    """Return only hard composition-limit violations for one board group."""
+    counts: dict[str, int] = {}
+    for item in items:
+        bucket = shot_bucket(item)
+        if bucket:
+            counts[bucket] = counts.get(bucket, 0) + 1
+    violations = {bucket: count for bucket, count in counts.items() if count > SHOT_LIMITS[bucket]}
+    if len(items) > MAX_PHOTOS_PER_BOARD:
+        violations["total"] = len(items)
+    return violations
+
+
+def _enforce_shot_limits(groups: list[list[dict]]) -> list[list[dict]]:
+    """Split proposed groups before a known shot-type limit is exceeded."""
+    limited: list[list[dict]] = []
+    for group in groups:
+        current: list[dict] = []
+        for item in group:
+            candidate = current + [item]
+            if current and group_limit_violations(candidate):
+                limited.append(current)
+                current = []
+            current.append(item)
+        if current:
+            limited.append(current)
+    return limited
 
 
 def _reconcile_late_card_groups(groups: list[list[dict]]) -> list[list[dict]]:
