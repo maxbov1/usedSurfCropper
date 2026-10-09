@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_URL="${USED_SURF_REPO_URL:-https://github.com/maxbov1/usedSurfCropper.git}"
 APP_NAME="UsedSurf.app"
-INSTALL_DIR="/Applications/$APP_NAME"
+INSTALL_DIR="${USED_SURF_INSTALL_DIR:-$HOME/Applications/$APP_NAME}"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/usedsurf-install.XXXXXX")"
 REPO_DIR="$TMP_ROOT/usedSurfCropper"
 
@@ -51,15 +51,16 @@ python3 -m venv .venv-build
 echo "Building the UsedSurf app for $(uname -m)…"
 bash scripts/build_mac_app.sh
 
-echo "Installing $APP_NAME in /Applications…"
+echo "Installing $APP_NAME in $INSTALL_DIR…"
+mkdir -p "$(dirname "$INSTALL_DIR")"
 if [[ -e "$INSTALL_DIR" ]]; then
-  sudo rm -rf "$INSTALL_DIR"
+  rm -rf "$INSTALL_DIR"
 fi
-sudo ditto --rsrc --extattr "$REPO_DIR/dist/$APP_NAME" "$INSTALL_DIR"
+ditto --rsrc --extattr "$REPO_DIR/dist/$APP_NAME" "$INSTALL_DIR"
 
 # Remove the quarantine bit when present so Finder can launch this locally-built
 # app without treating it as an untrusted downloaded bundle.
-sudo xattr -dr com.apple.quarantine "$INSTALL_DIR" 2>/dev/null || true
+xattr -dr com.apple.quarantine "$INSTALL_DIR" 2>/dev/null || true
 
 echo "Installed: $INSTALL_DIR"
 echo "Your photos and review history will live in ~/Library/Application Support/UsedSurf."

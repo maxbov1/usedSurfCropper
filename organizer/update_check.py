@@ -46,14 +46,16 @@ def startup_update_preflight() -> bool:
         request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "UsedSurf"})
         with urllib.request.urlopen(request, timeout=4) as response:
             latest_sha = json.loads(response.read().decode("utf-8")).get("sha", "")
+        log(f"startup check current={current_sha[:12]} latest={latest_sha[:12]}")
         if not latest_sha or latest_sha.startswith(current_sha):
+            log("startup check: already current")
             return False
         installer_url = f"https://raw.githubusercontent.com/{repository}/main/scripts/install_mac.sh?update={latest_sha[:12]}"
         script = log_root / "update-usedsurf.command"
         script.write_text(
             "#!/bin/bash\nset -euo pipefail\n"
             f"curl -fsSL {shlex.quote(installer_url)} -o \"$TMPDIR/usedsurf-update-installer.sh\"\n"
-            "bash \"$TMPDIR/usedsurf-update-installer.sh\"\n",
+            f"USED_SURF_BUILD_SHA={shlex.quote(latest_sha)} bash \"$TMPDIR/usedsurf-update-installer.sh\"\n",
             encoding="utf-8",
         )
         script.chmod(0o700)

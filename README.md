@@ -47,24 +47,25 @@ GitHub Actions builds separate Intel and Apple Silicon ZIPs on version tags.
 After the repository is configured, set `USED_SURF_GITHUB_REPO=owner/repo`
 when launching locally if you want Advanced Debug to show GitHub HEAD update
 status. The packaged app performs that check automatically; it is best effort
-and never blocks startup. It reports update availability; it does not silently
-replace the app bundle.
+and never blocks startup. The packaged app may open a visible updater Terminal
+session when a newer commit is available.
 
 For a non-technical Mac user, the one-command installer clones the repository,
 installs the build dependencies, builds the native app, and places the
-clickable application in `/Applications`:
+clickable application in the current user's `~/Applications` folder (which
+does not require administrator access):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maxbov1/usedSurfCropper/main/scripts/install_mac.sh | bash
 ```
 
-The installer may ask for the Mac administrator password when replacing an
-existing `/Applications/UsedSurf.app`. It does not put the build environment or
-source checkout in `/Applications`; user photos, review state, and corrections
-remain in `~/Library/Application Support/UsedSurf/`.
+The installer does not put the build environment or source checkout in the
+Applications folder; user photos, review state, and corrections remain in
+`~/Library/Application Support/UsedSurf/`. Set `USED_SURF_INSTALL_DIR` if a
+managed machine requires a different app location.
 
 Each packaged app records the commit it was built from. On startup it checks
-the public `main` branch; when a newer commit exists, macOS offers to open a
+the public `main` branch; only when the bundled commit differs does macOS open a
 visible updater Terminal session that rebuilds and replaces the app. Update
 checking is best effort and never prevents the cropper from starting.
 
