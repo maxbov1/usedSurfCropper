@@ -804,6 +804,10 @@ def create_app(root: Path) -> Flask:
             crop_root = crop_root / "true-test-set"
         progress_path = crop_root / "runs" / run_id / "progress.json"
         if not progress_path.exists():
+            with db() as conn:
+                run = conn.execute("SELECT status, error FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if run and run["status"] == "failed":
+                return jsonify({"status": "failed", "error": run["error"] or "The crop worker failed before writing progress.", "done": 0, "total": 0, "complete": False})
             return jsonify({"status": "starting", "done": 0, "total": 0, "complete": False})
         try:
             progress = json.loads(progress_path.read_text())

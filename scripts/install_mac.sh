@@ -34,6 +34,10 @@ if ! command -v tesseract >/dev/null 2>&1; then
     echo "Install Homebrew from https://brew.sh, then run this installer again." >&2
   fi
 fi
+if ! command -v tesseract >/dev/null 2>&1; then
+  echo "Tesseract OCR is required for card identity extraction. Install Homebrew and rerun this installer." >&2
+  exit 1
+fi
 
 echo "Downloading UsedSurf…"
 git clone --depth 1 "$REPO_URL" "$REPO_DIR" >/dev/null

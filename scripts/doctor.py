@@ -37,11 +37,13 @@ def main() -> int:
 
     if not (ROOT / "yolo11n.pt").exists():
         warnings.append("yolo11n.pt is not present; YOLO-assisted paths may use fallback detection")
-    for module in ("PIL", "cv2"):
+    for module in ("PIL", "cv2", "pytesseract", "ultralytics"):
         try:
             __import__(module)
         except ImportError:
-            warnings.append(f"optional module unavailable: {module}")
+            warnings.append(f"runtime module unavailable: {module}")
+    if shutil.which("tesseract") is None:
+        warnings.append("native Tesseract executable unavailable; card OCR cannot run")
     free_gb = shutil.disk_usage(ROOT).free / (1024 ** 3)
     if free_gb < 2:
         warnings.append(f"low free disk space: {free_gb:.1f} GB")
