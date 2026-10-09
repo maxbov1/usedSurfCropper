@@ -20,6 +20,8 @@ if build_info_value:
         datas.append((str(build_info), "."))
 
 hiddenimports = [
+    "pytesseract",
+    "pytesseract.pytesseract",
     "ultralytics",
     "torch",
     "torch.nn",

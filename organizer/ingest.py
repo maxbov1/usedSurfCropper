@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -101,6 +102,7 @@ def ocr_runtime_status() -> dict[str, str | bool]:
     """Report whether both pytesseract and the native Tesseract binary work."""
     if pytesseract is None:
         return {"available": False, "status": "python_package_missing", "error": "pytesseract is not installed"}
+    _configure_tesseract_binary()
     try:
         version = str(pytesseract.get_tesseract_version()).splitlines()[0]
         return {"available": True, "status": "ready", "version": version}
@@ -111,6 +113,7 @@ def ocr_runtime_status() -> dict[str, str | bool]:
 def local_ocr(image: Image.Image, region: tuple[int, int, int, int] | None = None) -> tuple[str, dict[str, str], str]:
     if pytesseract is None:
         return "", {}, "pytesseract is not installed"
+    _configure_tesseract_binary()
     try:
         variants = []
         if region:
@@ -141,6 +144,19 @@ def local_ocr(image: Image.Image, region: tuple[int, int, int, int] | None = Non
     except Exception as exc:
         return "", {}, f"{type(exc).__name__}: {exc}"
     return text, extract_card_identifier(texts), ""
+
+
+def _configure_tesseract_binary() -> None:
+    """Make Finder-launched apps find Homebrew's Tesseract without a shell PATH."""
+    if pytesseract is None:
+        return
+    configured = Path(str(getattr(pytesseract.pytesseract, "tesseract_cmd", "tesseract")))
+    if configured.is_file():
+        return
+    candidates = [shutil.which("tesseract"), "/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract"]
+    binary = next((candidate for candidate in candidates if candidate and Path(candidate).is_file()), None)
+    if binary:
+        pytesseract.pytesseract.tesseract_cmd = binary
 
 
 def _ocr_signal_score(text: str) -> int:

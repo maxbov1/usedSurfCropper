@@ -387,15 +387,30 @@ def create_app(root: Path) -> Flask:
         with db() as conn:
             excluded = {row["source_path"] for row in conn.execute("SELECT source_path FROM excluded_sources")}
             current_sources = {str(item["path"].relative_to(root)) for item in scanned if "error" not in item}
+            current_by_source = {
+                str(item["path"].relative_to(root)): item
+                for item in scanned if "error" not in item
+            }
             # A new grouping pass must not inherit stale *unreviewed* board
             # ownership. That was the hidden data leak behind reruns looking
             # unchanged. Approved boards and explicit human moves are kept;
             # otherwise the old proposed folders are rebuilt from the current
             # visual/card evidence while grouping history remains in SQLite.
             active_rows = conn.execute(
-                "SELECT p.id, p.source_path, p.human_correction, p.review_status, b.status "
+                "SELECT p.id, p.source_path, p.content_hash, p.human_correction, p.review_status, b.status "
                 "FROM photos p JOIN boards b ON b.id=p.board_id WHERE p.source_path LIKE 'input/%'"
             ).fetchall()
+            changed_or_missing_ids = [
+                row["id"] for row in active_rows
+                if row["source_path"] not in current_sources
+                or row["content_hash"] != current_by_source[row["source_path"]]["hash"]
+            ]
+            if changed_or_missing_ids:
+                placeholders = ",".join("?" for _ in changed_or_missing_ids)
+                conn.execute(f"DELETE FROM grouping_predictions WHERE photo_id IN ({placeholders})", changed_or_missing_ids)
+                conn.execute(f"DELETE FROM grouping_corrections WHERE photo_id IN ({placeholders})", changed_or_missing_ids)
+                conn.execute(f"DELETE FROM photos WHERE id IN ({placeholders})", changed_or_missing_ids)
+                active_rows = [row for row in active_rows if row["id"] not in changed_or_missing_ids]
             has_locked_work = any(
                 row["status"] == "approved"
                 or row["review_status"] == "approved"
@@ -450,7 +465,7 @@ def create_app(root: Path) -> Flask:
                     if existing:
                         break
                 if not existing:
-                    existing = conn.execute("SELECT id FROM boards WHERE label=?", (label,)).fetchone()
+                    existing = conn.execute("SELECT id FROM boards WHERE label=? AND id IN (SELECT DISTINCT board_id FROM photos WHERE source_path LIKE 'input/%')", (label,)).fetchone()
                 board_id = existing["id"] if existing else conn.execute("INSERT INTO boards(label, shaper, model, sku, fin_system, fins_included, status, created_at, processing_version) VALUES (?,?,?,?,?,?,?,?,?)", (label, ident.get("brand", ""), ident.get("model", ""), ident.get("sku", ""), ident.get("fin_system", ""), ident.get("fins_included", ""), "unreviewed", datetime.now().isoformat(timespec="seconds"), PROCESSING_VERSION)).lastrowid
                 if existing and (ident.get("brand") or ident.get("model") or ident.get("sku") or ident.get("fin_system") or ident.get("fins_included")):
                     # Populate only empty predictions; human corrections remain
@@ -611,7 +626,11 @@ def create_app(root: Path) -> Flask:
     @app.get("/shuffleboard")
     def shuffleboard():
         retest = None
-        retest_path = active_retest_path()
+        # Saved evaluation reports are opt-in. Automatically selecting the
+        # newest report made a real upload look like the old fixture whenever
+        # camera filenames happened to match (for example IMG_5930.JPG).
+        retest_requested = request.args.get("retest", "").lower() in {"1", "true", "yes"}
+        retest_path = active_retest_path() if retest_requested else None
         retest_edits = {}
         retest_edits_path = retest_path.with_name(f"{retest_path.stem}-edits.json") if retest_path else None
         if retest_path and retest_path.exists():
