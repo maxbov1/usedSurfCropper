@@ -22,9 +22,10 @@ class GroupingTests(unittest.TestCase):
         items += [photo("CARD.JPG", card=True), *[photo(f"NEXT_{index}.JPG", value=0.0) for index in range(5)]]
         groups = group_scanned(items)
         self.assertEqual(len(groups), 2)
-        self.assertEqual(len(groups[0]), 6)
-        self.assertTrue(groups[0][-1]["is_card"])
-        self.assertEqual(len(groups[1]), 5)
+        self.assertEqual(len(groups[0]), 5)
+        self.assertFalse(any(item["is_card"] for item in groups[0]))
+        self.assertTrue(groups[1][0]["is_card"])
+        self.assertEqual(len(groups[1]), 6)
 
     def test_consecutive_cards_remain_one_visible_conflict_group(self):
         items = [photo("CARD-1.JPG", card=True), photo("CARD-2.JPG", card=True), photo("VIEW.JPG")]
@@ -83,15 +84,36 @@ class GroupingTests(unittest.TestCase):
         self.assertEqual([len(group) for group in groups], [7])
         self.assertTrue(any(item.get("is_card") for item in groups[0]))
 
-    def test_card_stays_with_preceding_session_when_taken_last(self):
+    def test_trailing_card_moves_to_next_board_session(self):
         items = [
             *[{**photo(f"BLUE_{index}.JPG", value=0.0), "shot_type": "full_board"} for index in range(3)],
-            {**photo("CARD.JPG", card=True, value=0.2), "shot_type": "card"},
+            {**photo("CARD.JPG", card=True, value=0.0), "shot_type": "card"},
             *[{**photo(f"WHITE_{index}.JPG", value=0.2), "shot_type": "full_board"} for index in range(3)],
         ]
         groups = group_scanned(items)
-        self.assertEqual([len(group) for group in groups], [4, 3])
-        self.assertTrue(any(item.get("is_card") for item in groups[0]))
+        self.assertEqual([len(group) for group in groups], [3, 4])
+        self.assertTrue(any(item.get("is_card") for item in groups[1]))
+
+    def test_late_card_moves_to_visually_matching_following_board(self):
+        items = [
+            {**photo("LAST-FIN.JPG", value=0.0), "shot_type": "fin_detail"},
+            {**photo("CARD.JPG", card=True, value=0.2), "shot_type": "card"},
+            *[{**photo(f"NEXT_{index}.JPG", value=0.2), "shot_type": "full_board"} for index in range(4)],
+        ]
+        groups = group_scanned(items)
+        self.assertEqual([len(group) for group in groups], [1, 5])
+        self.assertFalse(any(item.get("is_card") for item in groups[0]))
+        self.assertTrue(any(item.get("is_card") for item in groups[1]))
+
+    def test_card_does_not_stay_after_preceding_photo_set(self):
+        items = [
+            *[{**photo(f"BOARD_{index}.JPG", value=0.0), "shot_type": "full_board"} for index in range(4)],
+            {**photo("CARD.JPG", card=True, value=0.2), "shot_type": "card"},
+            *[{**photo(f"NEXT_{index}.JPG", value=0.2), "shot_type": "full_board"} for index in range(4)],
+        ]
+        groups = group_scanned(items)
+        self.assertEqual([len(group) for group in groups], [4, 5])
+        self.assertTrue(any(item.get("is_card") for item in groups[1]))
 
     def test_uncertain_generic_details_do_not_trigger_fin_limit(self):
         items = [

@@ -29,7 +29,7 @@ except ImportError:
     pass
 
 SUPPORTED = {".jpg", ".jpeg", ".png", ".heic"}
-PROCESSING_VERSION = "0.11.0-local-board-neighborhoods"
+PROCESSING_VERSION = "0.12.0-forward-card-identity"
 MAX_PHOTOS_PER_BOARD = 7
 STANDARD_BOARD_PHOTOS = 6
 SHOT_LIMITS = {"full_board": 4, "side_profile": 1, "fin_detail": 1, "card": 1}
@@ -505,8 +505,34 @@ def group_scanned(files: list[dict]) -> list[list[dict]]:
             current = []
     if current:
         groups.append(current)
-    visually_grouped = _split_by_board_similarity([group for group in groups if group])
+    card_reconciled = _reassign_late_cards([group for group in groups if group])
+    visually_grouped = _split_by_board_similarity(card_reconciled)
     return _enforce_shot_limits(visually_grouped)
+
+
+def _reassign_late_cards(groups: list[list[dict]]) -> list[list[dict]]:
+    """Move trailing identity cards onto the next board-similarity group.
+
+    In this capture set the identity frame is consistently the first frame of
+    the next board session from the organizer's perspective, even when its
+    timestamp sorts immediately after the previous board's last angle. The
+    visual grouping has already produced the candidate sessions; this pass
+    corrects only that one-card positional offset.
+    """
+    working = [list(group) for group in groups]
+    for index, group in enumerate(working[:-1]):
+        cards = [item for item in group if item.get("is_card")]
+        if len(cards) != 1 or not group or group[-1] is not cards[0]:
+            continue
+        following = working[index + 1]
+        if any(item.get("is_card") for item in following):
+            continue
+        before = [item for item in group if not item.get("is_card")]
+        if len(following) + 1 > MAX_PHOTOS_PER_BOARD:
+            continue
+        working[index] = before
+        working[index + 1] = [cards[0], *following]
+    return [group for group in working if group]
 
 
 def _split_by_board_similarity(groups: list[list[dict]]) -> list[list[dict]]:
