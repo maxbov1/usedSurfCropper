@@ -8,6 +8,7 @@ import subprocess
 import sys
 import sqlite3
 import tempfile
+import traceback
 import zipfile
 from io import BytesIO
 from datetime import datetime
@@ -49,6 +50,15 @@ def create_app(root: Path) -> Flask:
     app.secret_key = "usedsurf-local-only"
     directories = paths(root)
     db_path = directories["data"] / "usedsurf.sqlite3"
+    upload_log_path = directories["data"] / "logs" / "upload.log"
+
+    def write_upload_log(message: str) -> None:
+        try:
+            upload_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with upload_log_path.open("a", encoding="utf-8") as stream:
+                stream.write(f"[{datetime.now().isoformat(timespec='seconds')}] {message}\n")
+        except OSError:
+            pass
 
     def db():
         return connect(db_path)
@@ -227,6 +237,20 @@ def create_app(root: Path) -> Flask:
                 "compacted": sum(not (path / item.get("source", "")).exists() for item in items if item.get("status") == "verified"),
             })
         return render_template("retention.html", archives=archives)
+
+    @app.get("/debug/upload-log")
+    def upload_log():
+        if not upload_log_path.is_file():
+            return app.response_class("No upload events have been logged yet.\n", mimetype="text/plain")
+        return app.response_class(upload_log_path.read_text(errors="replace")[-30000:], mimetype="text/plain")
+
+    @app.post("/debug/client-log")
+    def client_log():
+        payload = request.get_json(silent=True) or {}
+        event = str(payload.get("event", "unknown"))[:120]
+        details = str(payload.get("details", ""))[:1000]
+        write_upload_log(f"browser event={event!r} details={details!r} user_agent={request.user_agent.string!r}")
+        return jsonify({"ok": True})
 
     @app.post("/debug/retention/<archive_name>/compact")
     def compact_retention(archive_name):
@@ -445,12 +469,17 @@ def create_app(root: Path) -> Flask:
     def upload():
         """Accept valid JPEGs and skip every other dropped file."""
         uploaded = request.files.getlist("photos")
+        write_upload_log(
+            f"request content_length={request.content_length!r} files_received={len(uploaded)} "
+            f"user_agent={request.user_agent.string!r}"
+        )
         accepted, rejected = [], []
         for item in uploaded:
             original_name = (item.filename or "").strip()
             suffix = Path(original_name).suffix.lower()
             if suffix not in {".jpg", ".jpeg"}:
                 rejected.append(f"{original_name or 'unnamed file'} — JPEG only")
+                write_upload_log(f"rejected name={original_name!r} reason=extension")
                 continue
             stem = safe_name(Path(original_name).stem, fallback="photo")
             temporary = directories["input"] / f".{stem}.uploading"
@@ -467,16 +496,21 @@ def create_app(root: Path) -> Flask:
                     counter += 1
                 os.replace(temporary, destination)
                 accepted.append(destination.name)
+                write_upload_log(f"accepted name={original_name!r} stored={destination.name!r}")
                 with db() as conn:
                     conn.execute("DELETE FROM app_meta WHERE key='active_input_signature'")
                     conn.commit()
-            except Exception:
-                rejected.append(f"{original_name} — unreadable JPEG")
+            except Exception as exc:
+                rejected.append(f"{original_name} — {exc}")
+                write_upload_log(f"rejected name={original_name!r} reason={exc!r}\n{traceback.format_exc()}")
                 try:
                     temporary.unlink()
                 except FileNotFoundError:
                     pass
-        return jsonify({"ok": True, "accepted": accepted, "rejected": rejected, "message": f"Added {len(accepted)} JPEG" + ("s" if len(accepted) != 1 else "") + " to this batch."})
+        if not uploaded:
+            write_upload_log("request completed with no files; likely browser drag/drop or form-data failure")
+        write_upload_log(f"request complete accepted={len(accepted)} rejected={len(rejected)}")
+        return jsonify({"ok": True, "accepted": accepted, "rejected": rejected, "message": f"Added {len(accepted)} JPEG" + ("s" if len(accepted) != 1 else "") + " to this batch.", "diagnostic_log_url": url_for("upload_log")})
 
     @app.post("/cleanup")
     def cleanup():
