@@ -50,6 +50,19 @@ status. The packaged app performs that check automatically; it is best effort
 and never blocks startup. It reports update availability; it does not silently
 replace the app bundle.
 
+For a non-technical Mac user, the one-command installer clones the repository,
+installs the build dependencies, builds the native app, and places the
+clickable application in `/Applications`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/maxbov1/usedSurfCropper/main/scripts/install_mac.sh | bash
+```
+
+The installer may ask for the Mac administrator password when replacing an
+existing `/Applications/UsedSurf.app`. It does not put the build environment or
+source checkout in `/Applications`; user photos, review state, and corrections
+remain in `~/Library/Application Support/UsedSurf/`.
+
 Open <http://127.0.0.1:5051>, upload a JPEG batch, and click **Continue**. Grouping uses capture time as the primary order, inventory cards as board start markers, and a lightweight OpenCV appearance signature to split an obvious visual change in a long cardless run. Ambiguous card conflicts stay in the review UI. Port 5051 is the default local port. For long local batches, use `scripts/run_local.sh` instead; it runs the app under macOS `caffeinate` so sleep does not suspend the local server. Use the project environment so local Tesseract OCR is available. There is deliberately no folder watcher: processing begins only after that explicit action.
 
 Optional OCR/HEIC capabilities on Apple Silicon:
