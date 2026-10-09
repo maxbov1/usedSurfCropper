@@ -22,15 +22,16 @@ class GroupingTests(unittest.TestCase):
         items += [photo("CARD.JPG", card=True), *[photo(f"NEXT_{index}.JPG", value=0.0) for index in range(5)]]
         groups = group_scanned(items)
         self.assertEqual(len(groups), 2)
-        self.assertTrue(groups[1][0]["is_card"])
-        self.assertEqual(len(groups[1]), 6)
+        self.assertEqual(len(groups[0]), 6)
+        self.assertTrue(groups[0][-1]["is_card"])
+        self.assertEqual(len(groups[1]), 5)
 
     def test_consecutive_cards_remain_one_visible_conflict_group(self):
         items = [photo("CARD-1.JPG", card=True), photo("CARD-2.JPG", card=True), photo("VIEW.JPG")]
         groups = group_scanned(items)
         self.assertEqual([sum(item["is_card"] for item in group) for group in groups], [1, 1])
 
-    def test_late_card_block_is_reconciled_into_cardless_neighbors(self):
+    def test_consecutive_late_cards_remain_explicit_conflicts(self):
         items = [
             *[photo(f"FIRST_{index}.JPG", value=0.0) for index in range(5)],
             *[photo(f"SECOND_{index}.JPG", value=1.0) for index in range(5)],
@@ -40,9 +41,8 @@ class GroupingTests(unittest.TestCase):
             *[photo(f"THIRD_{index}.JPG", value=2.0) for index in range(5)],
         ]
         groups = group_scanned(items)
-        self.assertEqual([len(group) for group in groups], [6, 6, 6])
-        self.assertEqual([sum(item["is_card"] for item in group) for group in groups], [1, 1, 1])
-        self.assertEqual([group[-1]["path"].name for group in groups], ["CARD-1.JPG", "CARD-2.JPG", "THIRD_4.JPG"])
+        self.assertEqual([len(group) for group in groups], [6, 5, 1, 6])
+        self.assertEqual([sum(item["is_card"] for item in group) for group in groups], [0, 1, 1, 1])
 
     def test_oversized_capture_is_split_under_hard_group_cap(self):
         items = [photo(f"IMG_{index}.JPG", value=0.0) for index in range(13)]
@@ -90,8 +90,8 @@ class GroupingTests(unittest.TestCase):
             *[{**photo(f"WHITE_{index}.JPG", value=0.2), "shot_type": "full_board"} for index in range(3)],
         ]
         groups = group_scanned(items)
-        self.assertEqual([len(group) for group in groups], [3, 4])
-        self.assertTrue(any(item.get("is_card") for item in groups[1]))
+        self.assertEqual([len(group) for group in groups], [4, 3])
+        self.assertTrue(any(item.get("is_card") for item in groups[0]))
 
     def test_uncertain_generic_details_do_not_trigger_fin_limit(self):
         items = [

@@ -430,81 +430,40 @@ def group_scanned(files: list[dict]) -> list[list[dict]]:
     """
     if not files:
         return []
-
-    def split_cardless(run: list[dict]) -> list[list[dict]]:
-        if len(run) <= MAX_PHOTOS_PER_BOARD:
-            return [run] if run else []
-        groups: list[list[dict]] = []
-        remaining = list(run)
-        while len(remaining) > STANDARD_BOARD_PHOTOS:
-            # The capture protocol is the primary signal. Do not let a noisy
-            # timestamp or a weak visual jump move a normal session boundary.
-            cut = STANDARD_BOARD_PHOTOS
-            groups.append(remaining[:cut])
-            remaining = remaining[cut:]
-        if remaining:
-            groups.append(remaining)
-        return groups
-
-    def split_late_card_predecessors(run: list[dict], card_count: int) -> list[list[dict]] | None:
-        """Divide a preceding cardless run among a consecutive late-card block."""
-        destination_count = card_count - 1
-        if destination_count < 1 or len(run) < destination_count or len(run) > destination_count * STANDARD_BOARD_PHOTOS:
-            return None
-        base, remainder = divmod(len(run), destination_count)
-        groups: list[list[dict]] = []
-        cursor = 0
-        for destination in range(destination_count):
-            size = base + (1 if destination < remainder else 0)
-            groups.append(run[cursor:cursor + size])
-            cursor += size
-        return groups
-
     groups: list[list[dict]] = []
-    cardless: list[dict] = []
     current: list[dict] = []
-    pending_cards: list[dict] = []
-    for position, item in enumerate(files):
-        if item.get("is_card"):
-            card_run = 0
-            while position + card_run < len(files) and files[position + card_run].get("is_card"):
-                card_run += 1
-            late_predecessors = split_late_card_predecessors(cardless, card_run)
-            groups.extend(late_predecessors if late_predecessors is not None else split_cardless(cardless))
-            cardless = []
-            if current and any(not photo.get("is_card") for photo in current):
-                groups.append(current)
-                current = []
-            # Every card starts a new board. Consecutive cards are an explicit
-            # conflict: hold them until a listing photo arrives so the UI shows
-            # one reviewable conflict group instead of several useless
-            # one-photo folders.
-            pending_cards.append(item)
-            continue
-        if pending_cards:
-            current = pending_cards + [item]
-            pending_cards = []
-            continue
-        if current:
-            current.append(item)
-        else:
-            cardless.append(item)
-        # A card + five listing photos is the normal complete board. Do not
-        # close early for a possible seventh fins/detail shot; the next card
-        # or the max-size guard below will resolve it.
-        if len(current) > MAX_PHOTOS_PER_BOARD and sum(item.get("is_card", False) for item in current) <= 1:
-            groups.append(current[:MAX_PHOTOS_PER_BOARD])
-            cardless = current[MAX_PHOTOS_PER_BOARD:]
+    for item in files:
+        has_card = any(photo.get("is_card") for photo in current)
+        card_closes_current = bool(current) and item.get("is_card") and not has_card
+        # A second card is the next session marker only after the current
+        # session already has its identity card. A late card therefore joins
+        # the preceding board instead of becoming a singleton group.
+        if current and item.get("is_card") and has_card:
+            groups.append(current)
             current = []
-    groups.extend(split_cardless(cardless))
+            has_card = False
+        # Six board views is the standard cardless session. A card arriving at
+        # this boundary is still allowed to join it as its identity anchor;
+        # another board view starts the next session.
+        elif current and not has_card and len(current) >= STANDARD_BOARD_PHOTOS and not item.get("is_card"):
+            groups.append(current)
+            current = []
+        if current and len(current) >= MAX_PHOTOS_PER_BOARD:
+            groups.append(current)
+            current = []
+        current.append(item)
+        if card_closes_current:
+            groups.append(current)
+            current = []
+            continue
+        if len(current) >= MAX_PHOTOS_PER_BOARD:
+            groups.append(current)
+            current = []
     if current:
         groups.append(current)
-    if pending_cards:
-        groups.append(pending_cards)
-    reconciled = _reconcile_late_card_groups([group for group in groups if group])
     # A card-bearing session is the only place where visual evidence may
     # split a group: it is a protocol-violation guard, not the normal grouper.
-    card_anchored = _split_card_anchor_mismatches(reconciled)
+    card_anchored = _split_card_anchor_mismatches([group for group in groups if group])
     return _enforce_shot_limits(card_anchored)
 
 
@@ -590,85 +549,3 @@ def _enforce_shot_limits(groups: list[list[dict]]) -> list[list[dict]]:
         if current:
             limited.append(current)
     return limited
-
-
-def _reconcile_late_card_groups(groups: list[list[dict]]) -> list[list[dict]]:
-    """Put cards with their neighboring cardless shoots when timestamps bunch them.
-
-    Camera metadata can put several inventory-card photos after the listing
-    photos they identify. The normal scanner correctly keeps those cards from
-    being swallowed, but a consecutive late-card block otherwise becomes one
-    conflict group and overflows the final listing photos into a new tail
-    group. Only reconcile a multi-card block when the surrounding cardless
-    groups fit the normal 5–7 photo contract; ambiguous groups stay visible for
-    human review.
-    """
-    if not groups:
-        return []
-    working = [list(group) for group in groups]
-    index = 0
-    while index < len(working):
-        group = working[index]
-        cards = [item for item in group if item.get("is_card")]
-        if len(cards) < 2:
-            index += 1
-            continue
-        before: list[int] = []
-        cursor = index - 1
-        while cursor >= 0 and not any(item.get("is_card") for item in working[cursor]):
-            before.append(cursor)
-            cursor -= 1
-        before.reverse()
-        after: list[int] = []
-        cursor = index + 1
-        while cursor < len(working) and not any(item.get("is_card") for item in working[cursor]):
-            after.append(cursor)
-            cursor += 1
-        if len(before) < len(cards) - 1 and index == len(working) - 1:
-            # A late timestamp block can arrive after several already-valid
-            # card-bearing groups. In that terminal position, use the nearest
-            # earlier cardless groups as the missing destinations.
-            earlier_cardless = [
-                candidate
-                for candidate in range(index)
-                if not any(item.get("is_card") for item in working[candidate])
-            ]
-            if len(earlier_cardless) >= len(cards) - 1:
-                before = earlier_cardless[-(len(cards) - 1) :]
-                after = []
-        # Cards map to the cardless groups immediately before the late block,
-        # then to the first cardless group after it. This matches a camera
-        # sequence where card timestamps are clustered after the boards.
-        target_indices = before[-(len(cards) - 1) :] + after[:1]
-        virtual_last = len(target_indices) < len(cards) and len(before) >= len(cards) - 1 and not after
-        if len(target_indices) != len(cards) and not virtual_last:
-            index += 1
-            continue
-        non_cards = [item for item in group if not item.get("is_card")]
-        target_sizes = [len(working[target]) + 1 for target in target_indices]
-        if virtual_last:
-            target_sizes.append(1 + len(non_cards))
-        else:
-            target_sizes[-1] += len(non_cards)
-        if any(size > MAX_PHOTOS_PER_BOARD for size in target_sizes):
-            index += 1
-            continue
-        merged = []
-        for target, card in zip(target_indices, cards):
-            merged.append(list(working[target]) + [card])
-        if virtual_last:
-            merged.append([cards[-1], *non_cards])
-        else:
-            merged[-1].extend(non_cards)
-        selected = set(target_indices) | {index}
-        first = min(selected)
-        replacement: list[list[dict]] = []
-        for current_index, current_group in enumerate(working):
-            if current_index == first:
-                replacement.extend(merged)
-            if current_index in selected:
-                continue
-            replacement.append(current_group)
-        working = replacement
-        index = first + len(merged)
-    return working
