@@ -21,7 +21,7 @@ from .config import model_path, paths
 from .crop import _silhouette_mask
 from .db import connect, create_run, record_artifact, recover_stale_runs, set_run_worker, update_run
 from .export import export_board, safe_name
-from .ingest import MAX_PHOTOS_PER_BOARD, PROCESSING_VERSION, group_scanned, read_image, scan_files
+from .ingest import MAX_PHOTOS_PER_BOARD, PROCESSING_VERSION, group_scanned, ocr_runtime_status, read_image, scan_files
 from .retention import compact_archive, persist_manifest, prepare_archive
 
 try:
@@ -218,6 +218,11 @@ def create_app(root: Path) -> Flask:
                 ocr_status = json.loads(ocr_status_path.read_text())
             except (OSError, json.JSONDecodeError):
                 ocr_status = {"status": "unreadable"}
+        # The saved batch report can come from an older process/interpreter.
+        # Always show the runtime serving this diagnostics page as the source
+        # of truth for whether a new grouping pass can use OCR.
+        ocr_status["runtime"] = ocr_runtime_status()
+        ocr_status["runtime_python"] = sys.executable
         return render_template("debug.html", schema_version=schema["value"] if schema else "unknown",
                                active_photos=active, failed_runs=failed, running_runs=running,
                                artifact_count=artifacts, archive_count=len(archives),
