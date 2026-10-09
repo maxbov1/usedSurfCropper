@@ -63,6 +63,13 @@ class GroupingTests(unittest.TestCase):
         self.assertEqual(group_limit_violations(groups[0]), {})
         self.assertEqual(group_limit_violations(groups[1]), {})
 
+    def test_uncertain_generic_details_do_not_trigger_fin_limit(self):
+        items = [
+            {**photo("DETAIL-1.JPG"), "shot_type": "detail"},
+            {**photo("DETAIL-2.JPG"), "shot_type": "detail"},
+        ]
+        self.assertEqual(group_limit_violations(items), {})
+
 
 if __name__ == "__main__":
     unittest.main()

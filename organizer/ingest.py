@@ -32,7 +32,7 @@ SUPPORTED = {".jpg", ".jpeg", ".png", ".heic"}
 PROCESSING_VERSION = "0.4.0-late-card-reconciliation"
 MAX_PHOTOS_PER_BOARD = 7
 PREFERRED_PHOTOS_PER_BOARD = 6
-SHOT_LIMITS = {"full_board": 4, "side_profile": 1, "fin_detail": 1, "detail": 1, "card": 1}
+SHOT_LIMITS = {"full_board": 4, "side_profile": 1, "fin_detail": 1, "card": 1}
 
 
 def visual_signature(image: Image.Image) -> tuple[float, ...]:
