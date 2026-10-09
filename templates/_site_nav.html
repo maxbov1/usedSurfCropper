@@ -3,3 +3,29 @@
 <a class="site-brand" href="{{ url_for('index') }}"><img src="{{ url_for('static', filename='assets/usedsurf-logo.png') }}" alt="UsedSurf"><span>Cropper</span></a>
 <div class="site-nav-links"><a class="site-nav-link" href="{{ url_for('upload_photos') }}">Upload</a><a class="site-nav-link" href="{{ url_for('rules') }}">Rules</a><a class="site-nav-link" href="{{ url_for('how_to') }}">How To</a><details class="advanced-debug"><summary>Advanced debug</summary><div class="advanced-debug-menu"><a href="{{ url_for('debug_center') }}">Debug overview</a><a href="{{ url_for('runs') }}">Run control center</a></div></details></div>
 </nav>
+<script>
+(() => {
+  const spinner = '<span class="loading-spinner" aria-hidden="true"></span>';
+  function markBusy(button, label) {
+    if (!button || button.disabled || button.dataset.loading === 'true') return;
+    button.dataset.loading = 'true';
+    button.disabled = true;
+    button.innerHTML = spinner + (label || 'Working…');
+  }
+  document.addEventListener('submit', event => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement) || form.dataset.noBusy === 'true') return;
+    markBusy(event.submitter || form.querySelector('button[type="submit"]'), form.dataset.loadingLabel);
+  });
+  document.addEventListener('click', event => {
+    const button = event.target.closest('button[data-loading-action],#good,#save,#download-selected,.download-board,[data-label],#accept-model,#undo');
+    if (!button) return;
+    const label = button.dataset.loadingLabel ||
+      (button.id === 'good' ? 'Saving…' :
+       button.id === 'save' ? (button.closest('.shuffle-actions') ? 'Saving and starting crops…' : 'Saving crop…') :
+       button.id === 'download-selected' || button.classList.contains('download-board') ? 'Preparing ZIP…' :
+       button.dataset.label || button.id === 'accept-model' || button.id === 'undo' ? 'Saving label…' : 'Working…');
+    markBusy(button, label);
+  }, true);
+})();
+</script>
