@@ -25,6 +25,16 @@ for command_name in git python3; do
   fi
 done
 
+if ! command -v tesseract >/dev/null 2>&1; then
+  if command -v brew >/dev/null 2>&1; then
+    echo "Installing the native Tesseract OCR engine…"
+    brew install tesseract
+  else
+    echo "Warning: Homebrew/Tesseract is not installed. OCR card fields will be unavailable." >&2
+    echo "Install Homebrew from https://brew.sh, then run this installer again." >&2
+  fi
+fi
+
 echo "Downloading UsedSurf…"
 git clone --depth 1 "$REPO_URL" "$REPO_DIR" >/dev/null
 cd "$REPO_DIR"

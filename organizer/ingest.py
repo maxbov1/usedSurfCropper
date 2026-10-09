@@ -97,9 +97,20 @@ def read_image(path: Path) -> tuple[Image.Image, str | None]:
         return ImageOps.exif_transpose(opened).convert("RGB"), capture
 
 
-def local_ocr(image: Image.Image, region: tuple[int, int, int, int] | None = None) -> tuple[str, dict[str, str]]:
+def ocr_runtime_status() -> dict[str, str | bool]:
+    """Report whether both pytesseract and the native Tesseract binary work."""
     if pytesseract is None:
-        return "", {}
+        return {"available": False, "status": "python_package_missing", "error": "pytesseract is not installed"}
+    try:
+        version = str(pytesseract.get_tesseract_version()).splitlines()[0]
+        return {"available": True, "status": "ready", "version": version}
+    except Exception as exc:
+        return {"available": False, "status": "binary_missing_or_unusable", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def local_ocr(image: Image.Image, region: tuple[int, int, int, int] | None = None) -> tuple[str, dict[str, str], str]:
+    if pytesseract is None:
+        return "", {}, "pytesseract is not installed"
     try:
         variants = []
         if region:
@@ -127,9 +138,9 @@ def local_ocr(image: Image.Image, region: tuple[int, int, int, int] | None = Non
             texts.append(pytesseract.image_to_string(variant, config="--psm 6"))
             texts.append(pytesseract.image_to_string(ImageOps.autocontrast(ImageOps.grayscale(variant)), config="--psm 11"))
         text = max(texts, key=_ocr_signal_score, default="")
-    except Exception:
-        return "", {}
-    return text, extract_card_identifier(texts)
+    except Exception as exc:
+        return "", {}, f"{type(exc).__name__}: {exc}"
+    return text, extract_card_identifier(texts), ""
 
 
 def _ocr_signal_score(text: str) -> int:
@@ -310,6 +321,7 @@ def card_signal(text: str, identifier: dict[str, str]) -> bool:
 
 def scan_files(input_dir: Path) -> list[dict]:
     found = []
+    ocr_status = ocr_runtime_status()
     for path in sorted(input_dir.iterdir()):
         if not path.is_file() or path.suffix.lower() not in SUPPORTED:
             continue
@@ -347,18 +359,26 @@ def scan_files(input_dir: Path) -> list[dict]:
                     round(image.height * 0.68),
                 )
             likely_card = candidate_is_card or yellow_score >= 0.12
-            text, identifier = local_ocr(image, region) if likely_card else ("", {})
+            if likely_card:
+                text, identifier, ocr_error = local_ocr(image, region)
+                per_file_ocr_status = "read" if identifier else ("empty" if not ocr_error else "error")
+            else:
+                text, identifier, ocr_error = "", {}, ""
+                per_file_ocr_status = "not_run"
             found.append({
                 "path": path, "hash": sha256(path), "capture": capture, "width": image.width,
                 "height": image.height, "ocr": text, "identifier": identifier,
                 "card_candidate": candidate[:4] if candidate else None,
                 "card_confidence": candidate[4] if candidate else 0.0,
                 "yellow_card_score": yellow_score,
+                "ocr_status": per_file_ocr_status,
+                "ocr_error": ocr_error,
+                "ocr_runtime": ocr_status,
                 "visual_signature": visual_signature(image),
                 "is_card": card_signal(text, identifier) or candidate_is_card or yellow_score >= 0.35,
             })
         except Exception as exc:
-            found.append({"path": path, "error": str(exc), "capture": None, "width": None, "height": None, "ocr": "", "identifier": {}, "is_card": False, "visual_signature": ()})
+            found.append({"path": path, "error": str(exc), "capture": None, "width": None, "height": None, "ocr": "", "identifier": {}, "ocr_status": "scan_error", "ocr_error": "", "ocr_runtime": ocr_status, "is_card": False, "visual_signature": ()})
     # Stable tie-breaker is filename, but capture time remains primary.
     return sorted(found, key=lambda item: (item["capture"] is None, item["capture"] or "", item["path"].name.lower()))
 

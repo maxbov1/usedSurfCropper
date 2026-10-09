@@ -211,11 +211,18 @@ def create_app(root: Path) -> Flask:
                 update_status = json.loads(update_path.read_text())
             except (OSError, json.JSONDecodeError):
                 update_status = {"status": "unreadable"}
+        ocr_status = {"status": "not run"}
+        ocr_status_path = directories["data"] / "ocr-status.json"
+        if ocr_status_path.exists():
+            try:
+                ocr_status = json.loads(ocr_status_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                ocr_status = {"status": "unreadable"}
         return render_template("debug.html", schema_version=schema["value"] if schema else "unknown",
                                active_photos=active, failed_runs=failed, running_runs=running,
                                artifact_count=artifacts, archive_count=len(archives),
                                free_gb=disk.free / (1024 ** 3), cv2_available=_cv2_available(),
-                               yolo_available=model_path(root).exists(), db_path=db_path, update_status=update_status)
+                               yolo_available=model_path(root).exists(), db_path=db_path, update_status=update_status, ocr_status=ocr_status)
 
     @app.get("/debug/retention")
     def retention_review():
@@ -404,6 +411,24 @@ def create_app(root: Path) -> Flask:
                     conn.execute(f"DELETE FROM photos WHERE id IN ({placeholders})", stale_ids)
                     conn.execute("DELETE FROM boards WHERE status != 'approved' AND id NOT IN (SELECT DISTINCT board_id FROM photos)")
             groups = group_scanned(scanned)
+            ocr_runtime = next((item.get("ocr_runtime") for item in scanned if item.get("ocr_runtime")), {"available": False, "status": "not_checked"})
+            ocr_summary = {
+                "runtime": ocr_runtime,
+                "files_scanned": len(scanned),
+                "cards_detected": sum(1 for item in scanned if item.get("is_card")),
+                "identifiers_extracted": sum(1 for item in scanned if item.get("identifier")),
+                "ocr_attempts": sum(1 for item in scanned if item.get("ocr_status") in {"read", "empty", "error"}),
+                "ocr_errors": [
+                    {"source": str(item["path"].relative_to(root)), "error": item["ocr_error"]}
+                    for item in scanned if item.get("ocr_error")
+                ][:20],
+                "checked_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            try:
+                ocr_status_path = directories["data"] / "ocr-status.json"
+                ocr_status_path.write_text(json.dumps(ocr_summary, indent=2) + "\n")
+            except OSError:
+                pass
             initial_grouping = {}
             for group_number, group in enumerate(groups, start=1):
                 if not group:
@@ -458,10 +483,14 @@ def create_app(root: Path) -> Flask:
         with db() as conn:
             conn.execute("INSERT INTO app_meta(key,value) VALUES('active_input_signature',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (signature,))
             conn.execute("INSERT INTO app_meta(key,value) VALUES('active_grouping_run_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (group_run_id,))
-            update_run(conn, group_run_id, "complete", metadata={"scanned": len(scanned), "groups": len(groups), "cards": sum(1 for item in scanned if item.get("is_card"))})
+            update_run(conn, group_run_id, "complete", metadata={"scanned": len(scanned), "groups": len(groups), "cards": sum(1 for item in scanned if item.get("is_card")), "ocr": ocr_summary})
             conn.commit()
         card_count = sum(1 for item in scanned if item.get("is_card"))
         warning = " OCR/card detection found no card boundaries; review the group before editing." if card_count == 0 and scanned else ""
+        if not ocr_runtime.get("available"):
+            warning += f" OCR unavailable ({ocr_runtime.get('error') or ocr_runtime.get('status')}); install/check Tesseract before relying on card identity."
+        elif ocr_summary["cards_detected"] and not ocr_summary["identifiers_extracted"]:
+            warning += " Cards were detected but OCR extracted no identifiers; open Advanced debug and inspect OCR status."
         flash(f"Grouped {len(scanned)} originals into {len(groups)} proposed folder(s), six standard or seven with fins. Cropping has not run.{warning}", "success")
         return redirect(url_for("shuffleboard"))
 
