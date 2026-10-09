@@ -382,8 +382,17 @@ def create_app(root: Path) -> Flask:
             previous = conn.execute("SELECT value FROM app_meta WHERE key='active_input_signature'").fetchone()
             active_count = conn.execute("SELECT COUNT(*) n FROM photos WHERE source_path LIKE 'input/%'").fetchone()["n"]
         if previous and previous["value"] == signature and active_count:
-            flash("This batch is already grouped. Review the current folders before starting another pass.", "success")
-            return redirect(url_for("shuffleboard"))
+            ocr_status_path = directories["data"] / "ocr-status.json"
+            saved_ocr_runtime = {}
+            try:
+                saved_ocr_runtime = json.loads(ocr_status_path.read_text()).get("runtime", {})
+            except (OSError, json.JSONDecodeError, AttributeError):
+                pass
+            ocr_recovered = not saved_ocr_runtime.get("available", False) and ocr_runtime_status().get("available", False)
+            if not ocr_recovered:
+                flash("This batch is already grouped. Review the current folders before starting another pass.", "success")
+                return redirect(url_for("shuffleboard"))
+            flash("OCR is now available; rescanning this batch for board identity fields.", "success")
         group_run_id = datetime.now().strftime("group-%Y%m%d-%H%M%S-%f")
         with db() as conn:
             create_run(conn, group_run_id, "grouping", pipeline_version=PROCESSING_VERSION,
