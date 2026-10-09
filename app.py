@@ -71,6 +71,11 @@ def show_fatal_startup_error(phase: str, error: BaseException) -> None:
 
 
 try:
+    # Run this before importing Flask/OpenCV/Torch or touching the database so
+    # a broken older app can still replace itself with the latest main build.
+    from organizer.update_check import startup_update_preflight
+    if startup_update_preflight():
+        raise SystemExit(0)
     from organizer.config import runtime_root
     from organizer.update_check import check_github_async
     from organizer.web import create_app

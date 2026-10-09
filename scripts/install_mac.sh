@@ -64,3 +64,4 @@ sudo xattr -dr com.apple.quarantine "$INSTALL_DIR" 2>/dev/null || true
 echo "Installed: $INSTALL_DIR"
 echo "Your photos and review history will live in ~/Library/Application Support/UsedSurf."
 open -R "$INSTALL_DIR"
+open "$INSTALL_DIR"

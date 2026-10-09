@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import subprocess
 import threading
 import urllib.request
 from datetime import datetime
@@ -12,6 +14,61 @@ import sys
 
 
 DEFAULT_REPOSITORY = "maxbov1/usedSurfCropper"
+
+
+def startup_update_preflight() -> bool:
+    """Launch the latest installer before heavy app imports when needed.
+
+    Returns True when the caller should exit because an updater was launched.
+    Network failures are deliberately non-fatal so the local app still works offline.
+    """
+    if sys.platform != "darwin" or not getattr(sys, "frozen", False):
+        return False
+    if os.environ.get("USED_SURF_DISABLE_AUTO_UPDATE") == "1":
+        return False
+    repository = os.environ.get("USED_SURF_GITHUB_REPO", DEFAULT_REPOSITORY).strip().strip("/")
+    current_sha = bundled_commit()
+    if not repository or "/" not in repository or not current_sha:
+        return False
+    log_root = Path.home() / "Library" / "Application Support" / "UsedSurf" / "logs"
+    log_path = log_root / "startup-update.log"
+
+    def log(message: str) -> None:
+        try:
+            log_root.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as stream:
+                stream.write(f"[{datetime.now().isoformat(timespec='seconds')}] {message}\n")
+        except OSError:
+            pass
+
+    try:
+        url = f"https://api.github.com/repos/{repository}/commits/HEAD"
+        request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "UsedSurf"})
+        with urllib.request.urlopen(request, timeout=4) as response:
+            latest_sha = json.loads(response.read().decode("utf-8")).get("sha", "")
+        if not latest_sha or latest_sha.startswith(current_sha):
+            return False
+        installer_url = f"https://raw.githubusercontent.com/{repository}/main/scripts/install_mac.sh?update={latest_sha[:12]}"
+        script = log_root / "update-usedsurf.command"
+        script.write_text(
+            "#!/bin/bash\nset -euo pipefail\n"
+            f"curl -fsSL {shlex.quote(installer_url)} -o \"$TMPDIR/usedsurf-update-installer.sh\"\n"
+            "bash \"$TMPDIR/usedsurf-update-installer.sh\"\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o700)
+        terminal_script = f"bash {shlex.quote(str(script))}"
+        result = subprocess.run(
+            ["/usr/bin/osascript", "-e", f'tell application "Terminal" to do script {json.dumps(terminal_script)}'],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        log(f"update available current={current_sha[:12]} latest={latest_sha[:12]} terminal_exit={result.returncode}")
+        return result.returncode == 0
+    except Exception as exc:
+        log(f"preflight update skipped: {type(exc).__name__}: {exc}")
+        return False
 
 
 def _write_status(root: Path, payload: dict) -> None:
