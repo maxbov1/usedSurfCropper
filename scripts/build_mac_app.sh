@@ -13,6 +13,10 @@ DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
 APP_ARCH="${APP_ARCH:-$(uname -m)}"
 export PYINSTALLER_CONFIG_DIR="${PYINSTALLER_CONFIG_DIR:-$ROOT_DIR/.pyinstaller}"
 mkdir -p "$PYINSTALLER_CONFIG_DIR"
+BUILD_SHA="${USED_SURF_BUILD_SHA:-$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)}"
+BUILD_INFO_PATH="$PYINSTALLER_CONFIG_DIR/build-info.json"
+printf '{"commit":"%s","repository":"maxbov1/usedSurfCropper"}\n' "$BUILD_SHA" > "$BUILD_INFO_PATH"
+export USED_SURF_BUILD_INFO_PATH="$BUILD_INFO_PATH"
 MODEL_PATH="$ROOT_DIR/yolo11n.pt"
 
 if [[ ! -f "$MODEL_PATH" ]]; then

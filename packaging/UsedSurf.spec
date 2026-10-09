@@ -1,4 +1,5 @@
 # PyInstaller build specification for the double-clickable macOS app.
+import os
 from pathlib import Path
 
 # PyInstaller exposes SPECPATH as the directory containing this spec file.
@@ -12,6 +13,11 @@ datas = [
 model = ROOT / "yolo11n.pt"
 if model.exists():
     datas.append((str(model), "models"))
+build_info_value = os.environ.get("USED_SURF_BUILD_INFO_PATH", "")
+if build_info_value:
+    build_info = Path(build_info_value)
+    if build_info.is_file():
+        datas.append((str(build_info), "."))
 
 hiddenimports = [
     "ultralytics",
@@ -39,9 +45,8 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="UsedSurf",
     debug=False,
     bootloader_ignore_signals=False,
@@ -49,8 +54,16 @@ exe = EXE(
     upx=False,
     console=False,
 )
-app = BUNDLE(
+coll = COLLECT(
     exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="UsedSurf",
+)
+app = BUNDLE(
+    coll,
     name="UsedSurf.app",
     bundle_identifier="com.usedsurf.cropper",
     info_plist={

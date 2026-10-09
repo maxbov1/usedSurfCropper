@@ -63,6 +63,11 @@ existing `/Applications/UsedSurf.app`. It does not put the build environment or
 source checkout in `/Applications`; user photos, review state, and corrections
 remain in `~/Library/Application Support/UsedSurf/`.
 
+Each packaged app records the commit it was built from. On startup it checks
+the public `main` branch; when a newer commit exists, macOS offers to open a
+visible updater Terminal session that rebuilds and replaces the app. Update
+checking is best effort and never prevents the cropper from starting.
+
 Open <http://127.0.0.1:5051>, upload a JPEG batch, and click **Continue**. Grouping uses capture time as the primary order, inventory cards as board start markers, and a lightweight OpenCV appearance signature to split an obvious visual change in a long cardless run. Ambiguous card conflicts stay in the review UI. Port 5051 is the default local port. For long local batches, use `scripts/run_local.sh` instead; it runs the app under macOS `caffeinate` so sleep does not suspend the local server. Use the project environment so local Tesseract OCR is available. There is deliberately no folder watcher: processing begins only after that explicit action.
 
 Optional OCR/HEIC capabilities on Apple Silicon:
