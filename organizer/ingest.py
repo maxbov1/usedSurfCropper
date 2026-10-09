@@ -29,11 +29,10 @@ except ImportError:
     pass
 
 SUPPORTED = {".jpg", ".jpeg", ".png", ".heic"}
-PROCESSING_VERSION = "0.6.0-card-anchored-grouping"
+PROCESSING_VERSION = "0.7.0-capture-protocol-grouping"
 MAX_PHOTOS_PER_BOARD = 7
-PREFERRED_PHOTOS_PER_BOARD = 6
+STANDARD_BOARD_PHOTOS = 6
 SHOT_LIMITS = {"full_board": 4, "side_profile": 1, "fin_detail": 1, "card": 1}
-VISUAL_HARD_BOUNDARY = 0.10
 CARD_AFFINITY_GAP = 0.045
 
 
@@ -422,14 +421,12 @@ def scan_files(input_dir: Path) -> list[dict]:
 
 
 def group_scanned(files: list[dict]) -> list[list[dict]]:
-    """Group a capture-ordered batch using cards plus visual boundary checks.
+    """Group a capture-ordered batch using the known capture protocol.
 
-    A card is a *start marker*, never something that gets swallowed by the
-    preceding group. Cardless runs are split near the normal five listing
-    photos only when adjacent visual signatures show a strong change. This
-    handles shuffled filesystem arrival because ``scan_files`` has already
-    sorted by capture time, while avoiding the old "one giant time bucket"
-    failure.
+    A normal board session is six board views, optionally accompanied by one
+    identity card and one fin/detail view. Cards delimit identity sessions;
+    visual/ML signals validate a session and handle an actual protocol
+    violation, but do not choose an arbitrary timestamp-based cut point.
     """
     if not files:
         return []
@@ -439,29 +436,41 @@ def group_scanned(files: list[dict]) -> list[list[dict]]:
             return [run] if run else []
         groups: list[list[dict]] = []
         remaining = list(run)
-        while len(remaining) > MAX_PHOTOS_PER_BOARD:
-            # Prefer a boundary around five listing photos, but let a strong
-            # appearance change move it a little. The split is reviewable
-            # because the resulting group has no inventory card.
-            low = max(1, PREFERRED_PHOTOS_PER_BOARD - 1)
-            high = min(len(remaining) - 1, PREFERRED_PHOTOS_PER_BOARD + 2)
-            candidates = [(visual_distance(remaining[index - 1], remaining[index]), index) for index in range(low, high + 1)]
-            score, cut = max(candidates, default=(0.0, PREFERRED_PHOTOS_PER_BOARD), key=lambda value: value[0])
-            if score < 0.035:
-                cut = PREFERRED_PHOTOS_PER_BOARD
+        while len(remaining) > STANDARD_BOARD_PHOTOS:
+            # The capture protocol is the primary signal. Do not let a noisy
+            # timestamp or a weak visual jump move a normal session boundary.
+            cut = STANDARD_BOARD_PHOTOS
             groups.append(remaining[:cut])
             remaining = remaining[cut:]
         if remaining:
             groups.append(remaining)
         return groups
 
+    def split_late_card_predecessors(run: list[dict], card_count: int) -> list[list[dict]] | None:
+        """Divide a preceding cardless run among a consecutive late-card block."""
+        destination_count = card_count - 1
+        if destination_count < 1 or len(run) < destination_count or len(run) > destination_count * STANDARD_BOARD_PHOTOS:
+            return None
+        base, remainder = divmod(len(run), destination_count)
+        groups: list[list[dict]] = []
+        cursor = 0
+        for destination in range(destination_count):
+            size = base + (1 if destination < remainder else 0)
+            groups.append(run[cursor:cursor + size])
+            cursor += size
+        return groups
+
     groups: list[list[dict]] = []
     cardless: list[dict] = []
     current: list[dict] = []
     pending_cards: list[dict] = []
-    for item in files:
+    for position, item in enumerate(files):
         if item.get("is_card"):
-            groups.extend(split_cardless(cardless))
+            card_run = 0
+            while position + card_run < len(files) and files[position + card_run].get("is_card"):
+                card_run += 1
+            late_predecessors = split_late_card_predecessors(cardless, card_run)
+            groups.extend(late_predecessors if late_predecessors is not None else split_cardless(cardless))
             cardless = []
             if current and any(not photo.get("is_card") for photo in current):
                 groups.append(current)
@@ -493,31 +502,10 @@ def group_scanned(files: list[dict]) -> list[list[dict]]:
     if pending_cards:
         groups.append(pending_cards)
     reconciled = _reconcile_late_card_groups([group for group in groups if group])
-    visually_partitioned = _split_visual_boundaries(reconciled)
-    card_anchored = _split_card_anchor_mismatches(visually_partitioned)
+    # A card-bearing session is the only place where visual evidence may
+    # split a group: it is a protocol-violation guard, not the normal grouper.
+    card_anchored = _split_card_anchor_mismatches(reconciled)
     return _enforce_shot_limits(card_anchored)
-
-
-def _split_visual_boundaries(groups: list[list[dict]]) -> list[list[dict]]:
-    """Split a timestamp group when neighboring non-card frames visibly jump."""
-    partitioned: list[list[dict]] = []
-    for group in groups:
-        if len(group) < 3:
-            partitioned.append(group)
-            continue
-        start = 0
-        for index in range(1, len(group)):
-            left, right = group[index - 1], group[index]
-            # Cards are intentionally allowed to differ from the board photos;
-            # their OCR/card signal is the boundary evidence instead.
-            if left.get("is_card") or right.get("is_card"):
-                continue
-            if visual_distance(left, right) >= VISUAL_HARD_BOUNDARY:
-                partitioned.append(group[start:index])
-                start = index
-        if start < len(group):
-            partitioned.append(group[start:])
-    return [group for group in partitioned if group]
 
 
 def _split_card_anchor_mismatches(groups: list[list[dict]]) -> list[list[dict]]:

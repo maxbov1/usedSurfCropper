@@ -9,12 +9,12 @@ def photo(name, card=False, value=0.0):
 
 
 class GroupingTests(unittest.TestCase):
-    def test_visual_change_splits_long_cardless_run(self):
+    def test_capture_protocol_splits_long_cardless_run_into_six_view_sessions(self):
         items = [photo(f"IMG_{index}.JPG", value=0.0 if index < 5 else 1.0) for index in range(10)]
         groups = group_scanned(items)
         self.assertEqual([[item["path"].name for item in group] for group in groups], [
-            [f"IMG_{index}.JPG" for index in range(5)],
-            [f"IMG_{index}.JPG" for index in range(5, 10)],
+            [f"IMG_{index}.JPG" for index in range(6)],
+            [f"IMG_{index}.JPG" for index in range(6, 10)],
         ])
 
     def test_card_starts_next_board_instead_of_being_swallowed(self):
@@ -48,6 +48,7 @@ class GroupingTests(unittest.TestCase):
         items = [photo(f"IMG_{index}.JPG", value=0.0) for index in range(13)]
         groups = group_scanned(items)
         self.assertEqual(sum(len(group) for group in groups), 13)
+        self.assertEqual([len(group) for group in groups], [6, 6, 1])
         self.assertTrue(all(len(group) <= 7 for group in groups))
 
     def test_shot_limits_split_duplicate_fin_details(self):
