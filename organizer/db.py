@@ -9,13 +9,13 @@ from datetime import datetime
 from pathlib import Path
 
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 5
 
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS boards (
   id INTEGER PRIMARY KEY, label TEXT NOT NULL, shaper TEXT DEFAULT '', model TEXT DEFAULT '',
-  sku TEXT DEFAULT '', fin_system TEXT DEFAULT '', fins_included TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'unreviewed', created_at TEXT NOT NULL,
+  sku TEXT DEFAULT '', fin_system TEXT DEFAULT '', fin_box_count TEXT DEFAULT '', fins_included TEXT DEFAULT '', fins_present_count TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'unreviewed', created_at TEXT NOT NULL,
   approved_at TEXT, processing_version TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS photos (
@@ -130,8 +130,12 @@ def connect(db_path: Path) -> sqlite3.Connection:
     board_columns = {row["name"] for row in conn.execute("PRAGMA table_info(boards)")}
     if "fin_system" not in board_columns:
         conn.execute("ALTER TABLE boards ADD COLUMN fin_system TEXT DEFAULT ''")
+    if "fin_box_count" not in board_columns:
+        conn.execute("ALTER TABLE boards ADD COLUMN fin_box_count TEXT DEFAULT ''")
     if "fins_included" not in board_columns:
         conn.execute("ALTER TABLE boards ADD COLUMN fins_included TEXT DEFAULT ''")
+    if "fins_present_count" not in board_columns:
+        conn.execute("ALTER TABLE boards ADD COLUMN fins_present_count TEXT DEFAULT ''")
     if "card_fins_included" not in columns:
         conn.execute("ALTER TABLE photos ADD COLUMN card_fins_included TEXT DEFAULT ''")
     if "card_fin_system" not in columns:

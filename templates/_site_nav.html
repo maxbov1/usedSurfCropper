@@ -3,14 +3,30 @@
 <a class="site-brand" href="{{ url_for('index') }}"><img src="{{ url_for('static', filename='assets/usedsurf-logo.png') }}" alt="UsedSurf"><span>Cropper</span></a>
 <div class="site-nav-links"><a class="site-nav-link" href="{{ url_for('upload_photos') }}">Upload</a><a class="site-nav-link" href="{{ url_for('rules') }}">Rules</a><a class="site-nav-link" href="{{ url_for('how_to') }}">How To</a><details class="advanced-debug"><summary>Advanced debug</summary><div class="advanced-debug-menu"><a href="{{ url_for('debug_center') }}">Debug overview</a><a href="{{ url_for('runs') }}">Run control center</a></div></details></div>
 </nav>
+<div id="page-busy" class="page-busy" hidden role="status" aria-live="polite" aria-busy="true">
+<div class="page-busy-card"><span class="loading-spinner" aria-hidden="true"></span><strong id="page-busy-label">Working…</strong></div>
+</div>
 <script>
 (() => {
-  const spinner = '<span class="loading-spinner" aria-hidden="true"></span>';
+  const overlay = document.getElementById('page-busy');
+  const overlayLabel = document.getElementById('page-busy-label');
+  window.showPageBusy = function(label) {
+    if (!overlay) return;
+    document.body.classList.add('page-busy-active');
+    overlay.hidden = false;
+    if (overlayLabel) overlayLabel.textContent = label || 'Working…';
+  };
+  window.clearPageBusy = function() {
+    if (!overlay) return;
+    document.body.classList.remove('page-busy-active');
+    overlay.hidden = true;
+  };
   function markBusy(button, label) {
     if (!button || button.disabled || button.dataset.loading === 'true') return;
     button.dataset.loading = 'true';
     button.disabled = true;
-    button.innerHTML = spinner + (label || 'Working…');
+    button.textContent = label || 'Working…';
+    window.showPageBusy(label || 'Working…');
   }
   document.addEventListener('submit', event => {
     const form = event.target;

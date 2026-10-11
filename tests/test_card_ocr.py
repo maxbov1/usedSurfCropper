@@ -14,6 +14,7 @@ class CardOCRTests(unittest.TestCase):
             "brand": "JS",
             "model": "Monsta",
             "fin_system": "FCS II",
+            "fin_box_count": "3",
             "fins_included": "yes",
         })
 

@@ -1,45 +1,61 @@
 {
-    "invocation": {
-    "request_sha256": "447f802f9c61241e9ecefaa58a8da142bbf0c0b2265e58f53f114f1f2c5f4e3c"
+  "invocation": {
+    "request_sha256": "9999991ca0962d83113a5bc41b956a982d222dd42bd76449c8d2c911a28d0898"
   },
   "laws": {
     "general": [
       {
-        "id": "feedback.truthful",
-        "statement": "Code generated should not treat an intermediate UI state as a finalized human label."
-      },
-      {
-        "id": "state.observable",
-        "statement": "Code generated should not discard the model proposal or the human-saved result needed to explain a later model decision."
-      },
-      {
-        "id": "grouping.initial-snapshot",
-        "statement": "Code generated should not overwrite the complete initial grouping when a human begins dragging photos."
+        "id": "grouping.truthful",
+        "statement": "Code generated should not silently assign a photo to a board when the available evidence is below the grouping threshold."
       }
     ],
     "feature": [
       {
-        "id": "grouping.final-boundary",
-        "statement": "Code generated should not write grouping feedback as final until the user submits Save grouping and crop."
+        "id": "grouping.card-count-is-review-signal",
+        "statement": "Code generated should not merge or split visual clusters solely to make their count equal the inventory-card count."
       },
       {
-        "id": "grouping.complete-labels",
-        "statement": "Code generated should not train from only moved photos when unchanged final assignments are available; every reviewed photo needs an initial and final assignment."
+        "id": "grouping.visual-membership",
+        "statement": "Code generated should not allow a card match to override a strong visual boundary between contiguous board-photo runs."
       },
       {
-      }
-    ],
-    "negative_tests": [
+        "id": "grouping.explicit-evidence",
+        "statement": "Code generated should not assign a photo with explicit identity evidence to a card whose corresponding value contradicts that evidence."
+      },
       {
-        "name": "grouping feedback schema persists versioned state",
-        "law_id": "state.observable",
-        "production": "organizer/db.py",
-        "command": ["python3", "-m", "unittest", "tests.test_production.ProductionLifecycleTests.test_metadata_and_schema_version_are_persisted"],
-        "timeout_seconds": 60
+        "id": "grouping.angle-aware-evidence",
+        "statement": "Code generated should not infer an identity field from an angle that cannot reliably expose that field."
       }
     ]
   },
-  "check_laws": {
-    "swallowed_failures": ["feedback.truthful"]
-  }
+  "negative_tests": [
+    {
+      "name": "incompatible runs stay separate when card count is lower",
+      "law_id": "grouping.card-count-is-review-signal",
+      "production": "organizer/ingest.py",
+      "command": ["python3", "-m", "unittest", "tests.test_grouping.GroupingTests.test_visual_runs_are_not_forced_to_card_count"],
+      "timeout_seconds": 60
+    },
+    {
+      "name": "weak card match remains unassigned",
+      "law_id": "grouping.truthful",
+      "production": "organizer/ingest.py",
+      "command": ["python3", "-m", "unittest", "tests.test_grouping.GroupingTests.test_weak_card_match_is_not_forced"],
+      "timeout_seconds": 60
+    },
+    {
+      "name": "explicit identity contradiction is not assigned",
+      "law_id": "grouping.explicit-evidence",
+      "production": "organizer/ingest.py",
+      "command": ["python3", "-m", "unittest", "tests.test_grouping.GroupingTests.test_explicit_photo_identity_cannot_be_assigned_to_contradictory_card"],
+      "timeout_seconds": 60
+    },
+    {
+      "name": "identity evidence follows shot angle",
+      "law_id": "grouping.angle-aware-evidence",
+      "production": "organizer/board_evidence.py",
+      "command": ["python3", "-m", "unittest", "tests.test_board_evidence.BoardEvidenceTests.test_evidence_is_angle_specific_and_optional"],
+      "timeout_seconds": 60
+    }
+  ]
 }

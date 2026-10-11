@@ -17,6 +17,7 @@ FIELD_LABELS = {
     "brand": r"BRAND",
     "model": r"MODEL",
     "fin_system": r"FIN\s*SYSTEM",
+    "fin_box_count": r"(?:#\s*OF\s*)?BOX(?:ES|S)",
 }
 _FIELD_STOP = r"(?:BRAND|MODEL|LENGTH|WIDTH|THICKNESS|VOLUME|FIN\s*SYSTEM|PRICE|BOARD\s*TYPE|ITEM|BOARD)"
 _NOISE = re.compile(r"\b(?:CHECKED[- ]?IN|PERSONAL INFORMATION|BOARD INFORMATION|USEDSURF|CONSIGNMENT|PAYMENT|SIGNATURE)\b", re.I)
@@ -112,6 +113,17 @@ def _extract_fins_included(texts: Iterable[str]) -> str:
     return ""
 
 
+def _extract_fin_box_count(texts: Iterable[str]) -> str:
+    for text in texts:
+        for raw_line in normalize_ocr_text(text).splitlines():
+            line = re.sub(r"\s+", " ", raw_line.upper()).strip()
+            match = re.search(r"(?:#\s*OF\s*)?BOX(?:ES|S)\s*[:#-]?\s*(\d+(?:\.\d+)?)", line)
+            if match:
+                value = match.group(1)
+                return value[:-2] if value.endswith(".0") else value
+    return ""
+
+
 def _normalize_fin_system(value: str) -> str:
     value = re.sub(r"\s+", " ", value).strip()
     upper = value.upper().replace("FCS 8", "FCS II").replace("FCS LL", "FCS II")
@@ -139,4 +151,42 @@ def extract_card_identifier(texts: str | Iterable[str]) -> dict[str, str]:
     fins = _extract_fins_included(readings)
     if fins:
         identifier["fins_included"] = fins
+    fin_box_count = _extract_fin_box_count(readings)
+    if fin_box_count:
+        identifier["fin_box_count"] = fin_box_count
     return identifier
+
+
+def extract_card_identifier_with_confidence(texts: str | Iterable[str]) -> dict[str, dict[str, object]]:
+    """Return parsed card fields with simple, inspectable evidence strength.
+
+    This intentionally does not pretend to be a calibrated probability. A
+    field is stronger when the same normalized value appears in multiple OCR
+    passes, and weaker when it appears only once. The raw pass count is kept
+    so later training can replace this heuristic without changing the data
+    contract.
+    """
+    readings = _texts(texts)
+    identifier = extract_card_identifier(readings)
+    result: dict[str, dict[str, object]] = {}
+    for field, value in identifier.items():
+        key = value.casefold().strip()
+        occurrences = 0
+        for reading in readings:
+            candidates = [value]
+            if field in {"brand", "model", "fin_system"}:
+                candidates = _field_candidates([reading], field)
+            elif field == "sku":
+                candidates = [_extract_sku([reading])]
+            elif field == "fin_box_count":
+                candidates = [_extract_fin_box_count([reading])]
+            elif field == "fins_included":
+                candidates = [_extract_fins_included([reading])]
+            if any(candidate and candidate.casefold().strip() == key for candidate in candidates):
+                occurrences += 1
+        result[field] = {
+            "value": value,
+            "confidence": round(min(0.99, 0.45 + 0.15 * max(0, occurrences - 1)), 3),
+            "passes": occurrences,
+        }
+    return result

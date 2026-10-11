@@ -55,7 +55,7 @@ def export_board(root: Path, board, photos) -> Path:
             save_crop(root / photo["source_path"], temp / output_name, crop)
             exported.append({"source": photo["source_path"], "export": output_name, "shot_type": photo["shot_type"], "crop": {"x": crop[0], "y": crop[1], "width": crop[2], "height": crop[3]}, "review_status": photo["review_status"]})
             number += 1
-        manifest = {"board_id": board["id"], "sku": board["sku"], "shaper": board["shaper"], "model": board["model"], "fin_system": board["fin_system"], "fins_included": board["fins_included"], "status": "approved", "processing_version": board["processing_version"], "photos": exported}
+        manifest = {"board_id": board["id"], "sku": board["sku"], "shaper": board["shaper"], "model": board["model"], "fin_system": board["fin_system"], "fin_box_count": board["fin_box_count"], "fins_included": board["fins_included"], "fins_present_count": board["fins_present_count"], "status": "approved", "processing_version": board["processing_version"], "photos": exported}
         (temp / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         os.replace(temp, destination)
         return destination

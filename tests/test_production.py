@@ -25,7 +25,7 @@ class ProductionLifecycleTests(unittest.TestCase):
             db = connect(Path(folder) / "usedsurf.sqlite3")
             create_run(db, "group-1", "grouping", status="running")
             update_run(db, "group-1", "complete", metadata={"groups": 3})
-            self.assertEqual(db.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "3")
+            self.assertEqual(db.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "5")
             self.assertEqual(db.execute("SELECT metadata_json FROM runs WHERE run_id='group-1'").fetchone()[0], '{"groups": 3}')
 
     def test_retention_dry_run_preserves_source_until_apply(self):
