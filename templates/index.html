@@ -10,6 +10,7 @@
 const zone=document.getElementById('dropzone'),input=document.getElementById('photo-input'),choose=document.getElementById('choose-photos'),toast=document.getElementById('toast'),logAction=document.getElementById('upload-log-action'),continueForm=document.getElementById('continue-form'),continueButton=document.getElementById('continue-button'),batchCount=document.getElementById('batch-count'),uploadEmpty=document.getElementById('upload-empty');
 function clientLog(event,details=''){console.info(`[UsedSurf upload] ${event}`,details);fetch('{{ url_for('client_log') }}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({event,details})}).catch(()=>{});}
 function showUploadError(message){window.clearPageBusy?.();toast.textContent=message;toast.classList.add('error');if(logAction){logAction.hidden=false}if(batchCount)batchCount.textContent='Upload failed';if(uploadEmpty)uploadEmpty.textContent='No files have been successfully uploaded yet';}
+function uploadRequest(form,onProgress){return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open('POST','{{ url_for('upload') }}');xhr.upload.addEventListener('progress',event=>{if(event.lengthComputable)onProgress(Math.round(event.loaded/event.total*100))});xhr.onload=()=>resolve({status:xhr.status,body:xhr.responseText});xhr.onerror=()=>reject(new Error('Network error while uploading'));xhr.onabort=()=>reject(new Error('Upload was canceled'));xhr.send(form)})}
 choose.addEventListener('click',e=>{e.stopPropagation();input.click()});
 zone.addEventListener('click',()=>input.click());
 ['dragenter','dragover'].forEach(name=>zone.addEventListener(name,e=>{e.preventDefault();zone.classList.add('over')}));
@@ -27,12 +28,13 @@ async function upload(files){
   try{
     if(!files||!files.length){clientLog('no-files-detected','The browser delivered an empty FileList');showUploadError('No files were detected. Try Choose files, then select the JPEGs.');return;}
     const selected=[...files],count=selected.length;clientLog('upload-start',`files=${count} names=${selected.slice(0,5).map(file=>file.name).join('|')}`);
-    toast.classList.remove('error');logAction.hidden=true;window.showPageBusy?.(`Uploading ${count} photo${count===1?'':'s'}…`);
+    toast.classList.remove('error');logAction.hidden=true;toast.textContent=`Preparing ${count} photo${count===1?'':'s'}…`;window.showPageBusy?.(toast.textContent);
+    await new Promise(resolve=>requestAnimationFrame(()=>setTimeout(resolve,0)));
     const form=new FormData();selected.forEach(file=>form.append('photos',file,file.name));
-    const response=await fetch('{{ url_for('upload') }}',{method:'POST',body:form});
-    const body=await response.text();let result;try{result=JSON.parse(body)}catch{throw new Error(`Server returned HTTP ${response.status} with an unreadable response`)}
+    const response=await uploadRequest(form,percent=>{const label=percent<100?`Uploading ${count} photo${count===1?'':'s'}… ${percent}%`:'Saving uploaded photos…';toast.textContent=label;window.showPageBusy?.(label)});
+    let result;try{result=JSON.parse(response.body)}catch{throw new Error(`Server returned HTTP ${response.status} with an unreadable response`)}
     clientLog('upload-response',`http=${response.status} accepted=${result.accepted?.length||0} rejected=${result.rejected?.length||0}`);
-    if(!response.ok||!result.ok)throw new Error(result.error||`Upload failed with HTTP ${response.status}`);
+    if(response.status<200||response.status>=300||!result.ok)throw new Error(result.error||`Upload failed with HTTP ${response.status}`);
     if(result.rejected?.length){showUploadError([result.message,result.rejected.join(' · ')].filter(Boolean).join(' '));}else{window.showPageBusy?.(`Uploaded ${result.accepted?.length||0} photo${result.accepted?.length===1?'':'s'}.`)}
     if(result.accepted?.length)setTimeout(()=>location.reload(),650);else{if(batchCount)batchCount.textContent='0 files';if(uploadEmpty)uploadEmpty.textContent='Empty — No files have been successfully uploaded yet';if(!result.rejected?.length)showUploadError('No photos were accepted. Open upload diagnostics below.')}
   }catch(error){clientLog('upload-failure',String(error));showUploadError(`Upload failed: ${error.message}. Open upload diagnostics below.`)}
