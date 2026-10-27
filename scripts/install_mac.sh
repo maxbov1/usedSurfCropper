@@ -51,7 +51,7 @@ python3 -m venv .venv-build
 echo "Building the UsedSurf app for $(uname -m)…"
 bash scripts/build_mac_app.sh
 
-echo "Installing $APP_NAME in $INSTALL_DIR…"
+echo "Installing $APP_NAME in ${INSTALL_DIR}…"
 mkdir -p "$(dirname "$INSTALL_DIR")"
 if [[ -e "$INSTALL_DIR" ]]; then
   rm -rf "$INSTALL_DIR"
