@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from .segmentation import board_prompt_box, get_segmenter, mask_crop
+from .segmentation import SAM2_MASK_MIN_SCORE, board_perimeter, board_prompt_box, get_segmenter, mask_crop, validate_board_box
 from .yolo_detector import PROFILE_ROI_SCALE, detect_board
 
 try:
@@ -20,15 +20,63 @@ except ImportError:
 # measured from the detected board height.  This makes full-board shots
 # stackable across a board's light/dark deck and bottom views.
 DEFAULT_VERTICAL_PADDING = 0.10
-DEFAULT_HORIZONTAL_PADDING = 0.10
+DEFAULT_HORIZONTAL_PADDING = 0.25
 # Compatibility names retained for callers and saved settings.
 DEFAULT_END_PADDING = DEFAULT_VERTICAL_PADDING
 DEFAULT_RAIL_PADDING = DEFAULT_HORIZONTAL_PADDING
-# Side profiles use the same fixed board-relative margin.  Their width remains
-# natural; racks and fins never determine the profile crop center.
-# Profiles need slightly tighter nose/tail framing than deck/bottom shots;
-# horizontal padding remains independently controlled below.
+# Guarantees a minimum rail margin, as a fraction of the image's own width,
+# for full_board boards whose detected width sits at the narrow end of the
+# normal range - see _full_board_crop()'s docstring.
+DEFAULT_RAIL_PADDING_FLOOR_FRACTION = 0.12
+# Side profiles use a wider board-relative margin than full-board shots -
+# a profile's own silhouette is much narrower, so the same absolute gap
+# reads as cramped next to a deck/bottom view at the same zoom level.
+# Their width remains natural; racks and fins never determine the profile
+# crop center. Profiles need slightly tighter nose/tail framing than
+# deck/bottom shots; horizontal padding remains independently controlled
+# below.
 DEFAULT_PROFILE_PADDING = 0.08
+# Raised from 0.92 using real human correction data (9 manual side_profile
+# crops saved via the review UI, 2026-10-18 batch): reconstructing the
+# implied padding percentage from each correction (model box width vs. the
+# human-drawn width) gave 99%-185% across 6 of 7 usable cases (the 7th,
+# IMG_6472, was a different bug - the override path had swapped in a wrong
+# box, not a padding shortfall), median 141.6%. The corrected widths
+# themselves clustered 780-1160px regardless of how thin the raw detection
+# was (200-340px) - people are visually targeting something close to
+# full_board's own width range, not a percentage of the board's own
+# thickness. 92% was still too conservative even after two earlier bumps
+# today (35% -> 80% -> 92%).
+DEFAULT_PROFILE_HORIZONTAL_PADDING = 1.40
+# A side_profile box's own width isn't a stable reference to scale a
+# percentage off: it's true board thickness (~300px) on a clean edge-on
+# shot, but near-full deck width (~900px) on a 3/4-angle one - same shot
+# type, very different physical quantity. 92% of the thin case looks right;
+# 92% of the wide case blew a real photo's crop out to 2288px, eating 76%
+# of the frame, because the box wasn't thickness at all. The image's own
+# width is the one thing that doesn't shift meaning between photos, so it
+# caps how far the percentage is allowed to run.
+DEFAULT_PROFILE_HORIZONTAL_PADDING_CEILING_FRACTION = 0.15
+# A board with fins attached already shows extra width in a side_profile
+# box - the fin itself protrudes past the rail, inflating the raw detected
+# width beyond true board thickness. Padding on top of an already-inflated
+# box over-pads fin-equipped boards relative to fin-less ones at the same
+# percentage, so fin-confirmed boards get a smaller percentage. "Confirmed"
+# is load-bearing: this must only read boards.fins_included once a human
+# has saved/approved the board (status != 'unreviewed'), never the raw
+# auto-extracted OCR guess - an unreviewed guess feeding a crop decision is
+# exactly the misclassify-then-propagate failure mode seen elsewhere today
+# (full_board/side_profile mislabels silently driving the wrong padding).
+DEFAULT_PROFILE_HORIZONTAL_PADDING_WITH_FINS = 1.05
+# Below this classifier confidence, an unresolved side_profile SAM2/YOLO
+# mismatch (disagreement real, but YOLO not complete enough to override
+# with) gets declined to manual rather than shipping the un-cross-checked
+# SAM 2 box. Real data point pair: IMG_6491 (confidence 0.45, SAM 2's kept
+# box had bled into an adjacent board while staying within plausible aspect
+# bounds - a shape check alone can't catch that) must decline; IMG_6472
+# (confidence 0.823, a clean disagreement between two otherwise-reasonable
+# boxes) must not. 0.5 sits between the two measured cases.
+SIDE_PROFILE_MISMATCH_DECLINE_CONFIDENCE = 0.5
 DEFAULT_ROI_SEARCH_PADDING = 0.08
 PROFILE_YOLO_CONFIDENCE = 0.10
 FULL_BOARD_ROI_YOLO_CONFIDENCE = 0.05
@@ -188,8 +236,14 @@ def classify_shot(image: Image.Image, card: bool = False) -> dict[str, object]:
 def shared_full_board_padding(cases: list[dict], desired_vertical: float = DEFAULT_VERTICAL_PADDING, desired_horizontal: float = DEFAULT_HORIZONTAL_PADDING) -> dict[str, float | int | bool]:
     """Choose one safe padding ratio for all full-board photos in a group.
 
-    The tightest usable frame sets the group target. Each sibling therefore
-    receives the same board-relative padding without any crop inventing pixels.
+    The median usable frame sets the group target, not the single tightest
+    one. A strict minimum let one outlier photo (board captured close to a
+    frame edge) collapse padding for every sibling to near zero, even when
+    the rest had plenty of room (measured: 2.6% padding applied across a
+    whole 4-photo board because one photo had only 99px of floor below the
+    tail). The one genuinely tight photo still can't have pixels invented
+    for it - _full_board_crop's own per-photo clamp is the safety net for
+    that case, not this shared target.
     """
     vertical_support: list[float] = []
     horizontal_support: list[float] = []
@@ -203,22 +257,55 @@ def shared_full_board_padding(cases: list[dict], desired_vertical: float = DEFAU
         x, y, width, height = [float(value) for value in boundary[:4]]
         image_width, image_height = [float(value) for value in image_size]
         vertical_support.append(min(y, max(0.0, image_height - (y + height))) / max(height, 1.0))
-        horizontal_support.append(min(x, max(0.0, image_width - (x + width))) / max(height, 1.0))
+        horizontal_support.append(min(x, max(0.0, image_width - (x + width))) / max(width, 1.0))
     if not vertical_support or not horizontal_support:
         return {"available": False, "vertical": desired_vertical, "horizontal": desired_horizontal, "count": 0}
     return {
         "available": True,
-        "vertical": max(0.0, min(desired_vertical, min(vertical_support))),
-        "horizontal": max(0.0, min(desired_horizontal, min(horizontal_support))),
+        "vertical": max(0.0, min(desired_vertical, statistics.median(vertical_support))),
+        "horizontal": max(0.0, min(desired_horizontal, statistics.median(horizontal_support))),
         "count": len(vertical_support),
     }
 
 
-def suggested_crop(image: Image.Image, shot_type: str = "full_board", padding: float = DEFAULT_CROP_PADDING, classification: dict[str, object] | None = None, rail_padding: float | None = None) -> tuple[int, int, int, int, str]:
+def recover_outlier_full_board_box(
+    outlier_box: tuple[float, float, float, float],
+    sibling_boxes: list[tuple[tuple[float, float, float, float], float]],
+    image_width: float,
+) -> tuple[int, int, int, int]:
+    """Substitute a geometry-outlier full_board box's width AND center with
+    sibling-consistent values, keeping only the outlier's own y/height.
+
+    ``sibling_boxes`` is a list of (box, that_sibling's_own_image_width)
+    pairs - each sibling's center is expressed as a fraction of ITS OWN
+    frame before taking the median, since boxes alone aren't comparable
+    across photos of different resolutions.
+
+    The first version of this kept the outlier's own detected CENTER,
+    assuming a bad detector gets extent wrong but position right. Verified
+    false on a real photo (IMG_6481): rendering the result showed the
+    board's left rail clipped by the crop edge. A detector that only
+    catches PART of a board is biased in both width and position - that
+    photo's own center sat at 0.470 of image width while its three
+    full_board siblings clustered tightly at 0.503-0.517. Borrowing only
+    the sibling median width and keeping the outlier's own off-center
+    anchor produces a crop that's the right SIZE but still points at the
+    wrong place.
+    """
+    median_width = statistics.median(box[2] for box, _ in sibling_boxes)
+    median_center_fraction = statistics.median((box[0] + box[2] / 2) / w for box, w in sibling_boxes)
+    _, oy, _, oh = outlier_box
+    center_x = median_center_fraction * image_width
+    return (round(center_x - median_width / 2), round(oy), round(median_width), round(oh))
+
+
+def suggested_crop(image: Image.Image, shot_type: str = "full_board", padding: float = DEFAULT_CROP_PADDING, classification: dict[str, object] | None = None, rail_padding: float | None = None, fins_confirmed: bool = False) -> tuple[int, int, int, int, str]:
     """Return an orientation-normalized pixel crop. No pixel is invented."""
     width, height = image.size
     candidate = None
     profile_edge = None
+    sam_candidate = None
+    yolo_prompt = None
     boundary_source = "classifier"
     if shot_type == "auto":
         classification = classification or classify_shot(image)
@@ -229,64 +316,144 @@ def suggested_crop(image: Image.Image, shot_type: str = "full_board", padding: f
         classification = classification or classify_shot(image)
         candidate = classification.get("candidate")
         yolo = (classification or {}).get("yolo_detection")
-        usable_yolo = isinstance(yolo, dict) and _usable_yolo_box(yolo, width, height, shot_type)
-        # A partial/frame-touching profile box is useful evidence, but it is
-        # not safe to use as the crop extent. Let the OpenCV silhouette carry
-        # the full nose-to-tail boundary in that case.
-        if shot_type == "side_profile" and isinstance(yolo, dict):
-            usable_yolo = usable_yolo and _complete_profile_yolo_box(yolo, width, height)
-        if not usable_yolo:
-            if classification is not None:
-                classification["boundary_source"] = "OpenCV profile fallback" if shot_type == "side_profile" else "OpenCV full-board fallback"
-                classification["review"] = True
-            boundary_source = "OpenCV profile fallback" if shot_type == "side_profile" else "OpenCV full-board fallback"
-        if isinstance(yolo, dict):
-            refined = _contour_board_candidate_in_roi(array, yolo, min_width_fraction=0.03 if shot_type == "side_profile" else 0.18)
-            if refined is not None:
-                candidate = refined
-                boundary_source = "YOLO ROI + OpenCV contour"
-            elif usable_yolo:
-                candidate = (int(yolo["x"]), int(yolo["y"]), int(yolo["width"]), int(yolo["height"]))
-                boundary_source = "YOLO coarse box fallback"
-        if shot_type == "side_profile":
-            profile_edge = _bright_profile_candidate(array)
-            if profile_edge is not None and candidate is not None:
-                # Use the long board edge for horizontal centering, while
-                # retaining the detected vertical extent so fins and tail are
-                # not lost merely because the edge is narrow.
-                candidate = (profile_edge[0], candidate[1], profile_edge[2], candidate[3])
-        if shot_type == "full_board":
-            # Use YOLO only to narrow the search region. The final boundary is
-            # still the OpenCV contour, so this does not turn a coarse detector
-            # box into a product crop or add any pixels.
-            contour_box = None
+        # A confident YOLO box is centered on the real board far more
+        # reliably than SAM 2's own generic search region (measured: SAM 2
+        # given the generic prompt bled 300-1300px into the wall on one
+        # side on several real photos, even at a high score). Anchoring
+        # SAM 2's prompt to YOLO's box instead keeps its mask on the board.
+        yolo_prompt = usable_yolo_prompt_box(yolo, width, height, shot_type)
+        # Deliberately looser than yolo_prompt: prompting SAM 2 with a box
+        # that doesn't reach the board's nose/tail can mislead it into
+        # missing that end too, so usable_yolo_prompt_box() requires the box
+        # to span nose-to-tail. But cross-checking the FINAL crop only needs
+        # confidence in the box's rail position, not that it reaches every
+        # end - a real photo (IMG_6347) had a YOLO box that stopped 118px
+        # short of that nose threshold (601px vs. a 484px cutoff) while
+        # being pixel-accurate on the board's actual left/right edges the
+        # whole time. Sharing yolo_prompt's gate for both purposes meant the
+        # disagreement check never ran on it, silently shipping a crop whose
+        # near/far margins differed by 2.3x after SAM 2's mask bled into the
+        # wall - exactly what this check exists to catch.
+        yolo_cross_check = yolo_cross_check_box(yolo, width, height, shot_type)
+
+        sam_candidate = None
+        sam_score = None
+        self_refined = False
+        stored = classification.get("stored_perimeter") if classification is not None else None
+        if stored and stored.get("box") and stored.get("score") is not None:
+            # Grouping already ran SAM 2 on this photo (see
+            # organizer.segmentation.board_perimeter) and persisted the
+            # result. Reuse it instead of predicting a second time.
+            #
+            # board_perimeter() only validate_board_box()s a FRESHLY
+            # computed box before returning it - a stored value sitting in
+            # the DB from an earlier run predates that check and must be
+            # re-validated here, not just score-gated. Verified on a real
+            # photo (IMG_6248): a pre-fix stored box at a 0.67 width/height
+            # ratio (score 0.45, now also failing SAM2_MASK_MIN_SCORE, but
+            # a case like it could easily have cleared that bar) would
+            # otherwise bypass validate_board_box() entirely by virtue of
+            # only ever being checked at grouping time.
+            sam_score = stored["score"]
+            if sam_score >= SAM2_MASK_MIN_SCORE and validate_board_box(tuple(stored["box"]), shot_type, image.size):
+                sam_candidate = tuple(stored["box"])
+        else:
+            # suggested_crop() runs twice per photo in the batch worker
+            # (once to prime group padding stats, again inside
+            # rotated_crop_proposal). Cache on the shared classification
+            # dict so a live SAM 2 call only runs once per photo. This
+            # calls board_perimeter() rather than predicting directly so
+            # the self-refinement and shape-plausibility logic live in
+            # exactly one place, not duplicated here.
+            cached = classification.get("_sam2_result") if classification is not None else None
+            if cached is not None:
+                perimeter = cached
+            else:
+                perimeter = board_perimeter(image, shot_type, prompt_box=yolo_prompt)
+                if classification is not None:
+                    classification["_sam2_result"] = perimeter
+            if perimeter is not None:
+                sam_score = perimeter.get("score")
+                self_refined = bool(perimeter.get("self_refined"))
+                if perimeter.get("box") and sam_score is not None and sam_score >= SAM2_MASK_MIN_SCORE:
+                    sam_candidate = tuple(perimeter["box"])
+        if classification is not None:
+            classification["sam2_score"] = sam_score
+
+        if sam_candidate is not None:
+            if yolo_prompt is not None:
+                boundary_source = "SAM 2 mask (YOLO-guided)"
+            elif self_refined:
+                boundary_source = "SAM 2 mask (self-refined)"
+            else:
+                boundary_source = "SAM 2 mask"
+            candidate = sam_candidate
+        elif yolo_prompt is not None:
+            # SAM 2 rejected its own mask even with a good prompt; the YOLO
+            # box itself is still a confident, tight detection, so center the
+            # crop on it directly rather than falling through to OpenCV.
+            x1, y1, x2, y2 = yolo_prompt
+            candidate = (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
+            boundary_source = "YOLO coarse box"
+        else:
+            usable_yolo = isinstance(yolo, dict) and _usable_yolo_box(yolo, width, height, shot_type)
+            # A partial/frame-touching profile box is useful evidence, but it is
+            # not safe to use as the crop extent. Let the OpenCV silhouette carry
+            # the full nose-to-tail boundary in that case.
+            if shot_type == "side_profile" and isinstance(yolo, dict):
+                usable_yolo = usable_yolo and _complete_profile_yolo_box(yolo, width, height)
+            if not usable_yolo:
+                if classification is not None:
+                    classification["boundary_source"] = "OpenCV profile fallback" if shot_type == "side_profile" else "OpenCV full-board fallback"
+                    classification["review"] = True
+                boundary_source = "OpenCV profile fallback" if shot_type == "side_profile" else "OpenCV full-board fallback"
             if isinstance(yolo, dict):
-                contour_box = _contour_board_candidate_in_roi(array, yolo, min_width_fraction=0.18)
-                if contour_box is not None:
-                    boundary_source = "YOLO surfboard ROI + external contour"
-                elif _usable_yolo_box(yolo, width, height):
-                    contour_box = (int(yolo["x"]), int(yolo["y"]), int(yolo["width"]), int(yolo["height"]))
+                refined = _contour_board_candidate_in_roi(array, yolo, min_width_fraction=0.03 if shot_type == "side_profile" else 0.18)
+                if refined is not None:
+                    candidate = refined
+                    boundary_source = "YOLO ROI + OpenCV contour"
+                elif usable_yolo:
+                    candidate = (int(yolo["x"]), int(yolo["y"]), int(yolo["width"]), int(yolo["height"]))
                     boundary_source = "YOLO coarse box fallback"
-            if contour_box is None:
-                contour_box = _contour_board_candidate(array)
-            # A traced external contour is the primary boundary. A narrow contour
-            # is usually the stringer, a shadow, or an internal logo edge.
-            if contour_box is not None and contour_box[2] / max(image.width, 1) >= 0.25:
-                candidate = contour_box
-                if not boundary_source.startswith("YOLO"):
-                    boundary_source = "external contour"
-            elif candidate is None or candidate[2] / max(image.width, 1) < 0.25:
-                extrema_box = _extrema_board_candidate(array)
-                if extrema_box is not None and extrema_box[2] / max(image.width, 1) >= 0.25:
-                    candidate = extrema_box
-                    boundary_source = "silhouette extrema fallback"
-                else:
-                    broader = _find_board_candidate(array, "full_board")
-                    if broader is not None and broader[2] / max(image.width, 1) >= 0.25:
-                        candidate = broader
-                        boundary_source = "broad candidate fallback"
+            if shot_type == "side_profile":
+                profile_edge = _bright_profile_candidate(array)
+                if profile_edge is not None and candidate is not None:
+                    # Use the long board edge for horizontal centering, while
+                    # retaining the detected vertical extent so fins and tail are
+                    # not lost merely because the edge is narrow.
+                    candidate = (profile_edge[0], candidate[1], profile_edge[2], candidate[3])
+            if shot_type == "full_board":
+                # Use YOLO only to narrow the search region. The final boundary is
+                # still the OpenCV contour, so this does not turn a coarse detector
+                # box into a product crop or add any pixels.
+                contour_box = None
+                if isinstance(yolo, dict):
+                    contour_box = _contour_board_candidate_in_roi(array, yolo, min_width_fraction=0.18)
+                    if contour_box is not None:
+                        boundary_source = "YOLO surfboard ROI + external contour"
+                    elif _usable_yolo_box(yolo, width, height):
+                        contour_box = (int(yolo["x"]), int(yolo["y"]), int(yolo["width"]), int(yolo["height"]))
+                        boundary_source = "YOLO coarse box fallback"
+                if contour_box is None:
+                    contour_box = _contour_board_candidate(array)
+                # A traced external contour is the primary boundary. A narrow contour
+                # is usually the stringer, a shadow, or an internal logo edge.
+                if contour_box is not None and contour_box[2] / max(image.width, 1) >= 0.25:
+                    candidate = contour_box
+                    if not boundary_source.startswith("YOLO"):
+                        boundary_source = "external contour"
+                elif candidate is None or candidate[2] / max(image.width, 1) < 0.25:
+                    extrema_box = _extrema_board_candidate(array)
+                    if extrema_box is not None and extrema_box[2] / max(image.width, 1) >= 0.25:
+                        candidate = extrema_box
+                        boundary_source = "silhouette extrema fallback"
+                    else:
+                        broader = _find_board_candidate(array, "full_board")
+                        if broader is not None and broader[2] / max(image.width, 1) >= 0.25:
+                            candidate = broader
+                            boundary_source = "broad candidate fallback"
     if shot_type in {"full_board", "side_profile"} and candidate:
-            if shot_type == "side_profile" and cv2 is not None and np is not None:
+            if shot_type == "side_profile" and sam_candidate is None and cv2 is not None and np is not None:
                 array = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
                 if profile_edge is None:
                     candidate = _profile_body_candidate(array, candidate)
@@ -294,17 +461,98 @@ def suggested_crop(image: Image.Image, shot_type: str = "full_board", padding: f
             if classification is not None:
                 classification["opencv_boundary"] = [x, y, w, h]
                 classification["boundary_source"] = boundary_source
-            if shot_type == "side_profile":
-                crop = _profile_crop(x, y, w, h, width, height, max(padding, DEFAULT_PROFILE_PADDING))
-                confidence = classification["confidence"] if classification else "contour"
-                return (*crop, f"OpenCV shot classifier: side-profile silhouette ({confidence})")
-            crop = _full_board_crop(x, y, w, h, width, height, padding, DEFAULT_RAIL_PADDING if rail_padding is None else rail_padding)
+            label = boundary_source if boundary_source.startswith(("SAM 2", "YOLO")) else f"OpenCV {boundary_source}"
+            # When the chosen boundary disagrees sharply with a confident,
+            # independent YOLO detection, prefer YOLO's box over it rather
+            # than just flagging and shipping the disagreeing one anyway.
+            # Two detectors agreeing is reassuring, but one confidently
+            # contradicting the other is itself strong evidence the chosen
+            # box is wrong (real case: IMG_6347's SAM 2 mask bled into a
+            # wall shadow while YOLO stayed pixel-accurate on the rail the
+            # whole time). Still flagged for review either way -
+            # yolo_cross_check_box() only requires confidence in the rail
+            # position, not that the box reaches the nose/tail, so an
+            # override can still clip an end; a human should confirm a
+            # substitution, not just trust it as a better guess.
+            # Disagreement is checked against the raw detected box, not the
+            # final padded crop - padding is a cosmetic margin added equally
+            # on both sides, so a generous padding value shrinks the ratio
+            # between a confident YOLO box's near/far margins and can hide a
+            # genuinely bled boundary (measured: on IMG_6347's bled box, the
+            # margin ratio that correctly flagged it at 35% padding dropped
+            # below the 2.0 threshold at 80% padding, even though the
+            # underlying boundary was exactly as wrong either way).
+            mismatch = yolo_cross_check is not None and _crop_disagrees_with_yolo((x, y, w, h), yolo_cross_check)
+            overridden = False
+            if mismatch:
+                # A disagreement means the CHOSEN boundary shouldn't be
+                # trusted blindly, but that doesn't make YOLO's box safe to
+                # swap in either - yolo_cross_check_box() deliberately skips
+                # the nose-to-tail completeness bar usable_yolo_prompt_box()
+                # applies (see its docstring), so it can pass here on a box
+                # that's confident about rail position but frame-edge-clipped
+                # or otherwise incomplete. Real case (IMG_6491): YOLO found a
+                # box touching the frame's left edge (x=1) at 69% confidence,
+                # nowhere near SAM 2's centered, high-score mask - "disagree,
+                # then override onto the frame edge" is a worse crop than
+                # just flagging and keeping the original. Require the same
+                # completeness bar the primary boundary-selection path
+                # already uses before trusting YOLO enough to substitute it.
+                yolo_usable_as_crop = (
+                    isinstance(yolo, dict)
+                    and _usable_yolo_box(yolo, width, height, shot_type)
+                    and _yolo_box_not_edge_clipped(yolo, width)
+                )
+                if yolo_usable_as_crop:
+                    yx1, yy1, yx2, yy2 = yolo_cross_check
+                    x, y, w, h = int(yx1), int(yy1), int(yx2 - yx1), int(yy2 - yy1)
+                    label = "YOLO box (overrode disagreeing boundary)"
+                    overridden = True
+                if classification is not None:
+                    classification["opencv_boundary"] = [x, y, w, h]
+                    if overridden:
+                        classification["boundary_source"] = label
+                    classification["review"] = True
+                    classification["boundary_mismatch"] = True
+            if mismatch and not overridden and shot_type == "side_profile":
+                # Neither box is trustworthy here: the chosen boundary
+                # disagreed with YOLO (mismatch), and YOLO wasn't complete
+                # enough to safely override with (not overridden) - so
+                # shipping the chosen boundary anyway is just hoping it's
+                # the less-wrong one. When the shot classifier's own,
+                # independent read of the photo was ALSO low confidence,
+                # that's a third signal agreeing something's off, not just
+                # noise in one detector. Real case (IMG_6491): classifier
+                # confidence 0.45 ("no complete board silhouette"), SAM 2's
+                # kept box had bled into an adjacent board's edge while
+                # staying within plausible aspect-ratio bounds - a shape
+                # check alone can't catch that, but low classifier
+                # confidence already flagged the photo as ambiguous. A
+                # clean disagreement (IMG_6472, classifier confidence 0.823)
+                # must NOT decline here - that one just needs a human to
+                # pick between two otherwise-reasonable boxes.
+                classifier_confidence = classification.get("confidence") if classification else None
+                if isinstance(classifier_confidence, (int, float)) and classifier_confidence < SIDE_PROFILE_MISMATCH_DECLINE_CONFIDENCE:
+                    if classification is not None:
+                        classification["review"] = True
+                        classification["boundary_source"] = "declined: low-confidence unresolved mismatch"
+                    return 0, 0, width, height, f"no confidently usable boundary (classifier {classifier_confidence}, SAM 2/OpenCV and YOLO disagree, neither trustworthy enough to use); manual crop required"
+            suffix = " - overrode disagreeing SAM 2/OpenCV boundary, flagged for review" if overridden else " - disagreeing SAM 2/OpenCV boundary not confidently replaceable, flagged for review" if mismatch else ""
             confidence = classification["confidence"] if classification else "contour"
-            return (*crop, f"OpenCV {boundary_source}: full-board boundary ({confidence})")
+            if shot_type == "side_profile":
+                crop = _profile_crop(x, y, w, h, width, height, max(padding, DEFAULT_PROFILE_PADDING), fins_confirmed=fins_confirmed)
+                return (*crop, f"{label}: side-profile silhouette ({confidence}){suffix}")
+            crop = _full_board_crop(x, y, w, h, width, height, padding, DEFAULT_RAIL_PADDING if rail_padding is None else rail_padding)
+            return (*crop, f"{label}: full-board boundary ({confidence}){suffix}")
     if shot_type == "fin_detail":
         return 0, 0, width, height, "fin-detail framing preserved"
     if shot_type in {"detail", "accessory", "fins_closeup", "card", "keep_original"}:
         return 0, 0, width, height, "original framing"
+    if shot_type in {"full_board", "side_profile"}:
+        # SAM 2 (rejected or unavailable) and the YOLO/OpenCV/brightness
+        # fallback chain above both failed to find a usable boundary. Do not
+        # silently retry SAM 2 here with no score gate - send it to review.
+        return 0, 0, width, height, "no usable board boundary found; manual crop required"
     segmenter = get_segmenter()
     if segmenter is not None:
         prompt = board_prompt_box(width, height, shot_type)
@@ -323,13 +571,13 @@ def suggested_crop(image: Image.Image, shot_type: str = "full_board", padding: f
         return 0, 0, width, height, "OpenCV found no board-shaped candidate; manual crop required"
     x, y, w, h = candidate
     if shot_type == "side_profile":
-        crop = _profile_crop(x, y, w, h, width, height, padding)
+        crop = _profile_crop(x, y, w, h, width, height, padding, fins_confirmed=fins_confirmed)
         return (*crop, "OpenCV grayscale/edge profile candidate")
     crop = _full_board_crop(x, y, w, h, width, height, padding)
     return (*crop, "OpenCV grayscale/edge board candidate")
 
 
-def rotated_crop_proposal(image: Image.Image, shot_type: str = "auto", padding: float = DEFAULT_CROP_PADDING, classification: dict[str, object] | None = None, rail_padding: float | None = None) -> dict[str, object]:
+def rotated_crop_proposal(image: Image.Image, shot_type: str = "auto", padding: float = DEFAULT_CROP_PADDING, classification: dict[str, object] | None = None, rail_padding: float | None = None, fins_confirmed: bool = False) -> dict[str, object]:
     """Propose a small board-angle correction followed by a crop.
 
     The rotated image uses an expanded canvas, but a rotated crop is accepted
@@ -339,13 +587,19 @@ def rotated_crop_proposal(image: Image.Image, shot_type: str = "auto", padding: 
     classification = classification or classify_shot(image)
     resolved_type = classification["shot_type"] if shot_type == "auto" else shot_type
     if resolved_type not in {"full_board", "side_profile"}:
-        crop = suggested_crop(image, str(resolved_type), padding, classification=classification, rail_padding=rail_padding)
+        crop = suggested_crop(image, str(resolved_type), padding, classification=classification, rail_padding=rail_padding, fins_confirmed=fins_confirmed)
+        classification.pop("_sam2_result", None)
         reason = crop[4]
         return {"image": image, "crop": crop[:4], "shot_type": resolved_type, "angle": 0.0, "rotation_applied": False, "review": bool(classification.get("review", False)), "reason": reason}
     # Detect, refine, and pad in the original coordinate system first. The
     # rotation is deliberately the final transform; detector boxes must never
     # be reused against an image whose pixels have already moved.
-    base_crop = suggested_crop(image, str(resolved_type), padding, classification=classification, rail_padding=rail_padding)
+    base_crop = suggested_crop(image, str(resolved_type), padding, classification=classification, rail_padding=rail_padding, fins_confirmed=fins_confirmed)
+    # Drop the cached SAM 2 result now that both suggested_crop() calls for
+    # this photo (the batch worker's priming call and this one) are done -
+    # a SegmentationResult holds a raw mask array and isn't JSON-serializable,
+    # and classification dicts get written straight to report.json.
+    classification.pop("_sam2_result", None)
     angle = estimate_board_angle(image, str(resolved_type))
     if abs(angle) < 0.75:
         return {"image": image, "crop": base_crop[:4], "shot_type": resolved_type, "angle": 0.0, "rotation_applied": False, "review": bool(classification.get("review", False)), "reason": f"board already nearly upright; {base_crop[4]}"}
@@ -385,7 +639,7 @@ def _equal_vertical_padding_crop(crop: tuple[int, int, int, int], boundary: tupl
     crop_x, _, crop_width, _ = crop
     boundary_x, boundary_y, boundary_width, boundary_height = boundary
     image_width, image_height = image_size
-    requested = max(0, min(crop[1] - boundary_y, (crop[1] + crop[3]) - (boundary_y + boundary_height)))
+    requested = max(0, min(boundary_y - crop[1], (crop[1] + crop[3]) - (boundary_y + boundary_height)))
     available = min(boundary_y, max(0, image_height - (boundary_y + boundary_height)))
     padding = min(requested, available)
     return _clamp_crop(crop_x, boundary_y - padding, crop_width, boundary_height + 2 * padding, image_width, image_height)
@@ -712,16 +966,111 @@ def _usable_yolo_box(detection: dict[str, object], image_width: int, image_heigh
     return h >= image_height * 0.45 and ratio <= 1.0
 
 
+def _yolo_box_not_edge_clipped(detection: dict[str, object], image_width: int) -> bool:
+    """Return whether a box's left/right edges sit clear of the frame border.
+
+    Split out of _complete_profile_yolo_box() because the two checks there
+    answer different questions: nose-to-tail span (below) is about whether
+    a box is a complete enough VIEW to prompt or crop from top-to-bottom,
+    while this is about whether the box's horizontal position is even
+    plausible - a box touching the frame edge is often not looking at the
+    board at all. Real case (IMG_6491): a YOLO box at x=1 (touching the
+    left edge) got used to override a confident, centered SAM 2 mask,
+    producing a crop glued to the wrong edge of the photo. Checked alone,
+    without the nose-to-tail requirement, because that requirement rejects
+    a DIFFERENT, legitimate case (IMG_6347: a box 118px short of the nose
+    threshold that was still pixel-accurate on rail position).
+    """
+    x, w = int(detection.get("x", 0)), int(detection.get("width", 0))
+    return x > image_width * 0.02 and x + w < image_width * 0.98
+
+
 def _complete_profile_yolo_box(detection: dict[str, object], image_width: int, image_height: int) -> bool:
     """Return whether a profile box spans enough of the board to crop from."""
-    x, y = int(detection.get("x", 0)), int(detection.get("y", 0))
-    w, h = int(detection.get("width", 0)), int(detection.get("height", 0))
+    y, h = int(detection.get("y", 0)), int(detection.get("height", 0))
     return (
-        x > image_width * 0.02
-        and x + w < image_width * 0.98
+        _yolo_box_not_edge_clipped(detection, image_width)
         and y <= image_height * 0.12
         and y + h >= image_height * 0.82
     )
+
+
+def _crop_disagrees_with_yolo(
+    crop: tuple[int, int, int, int],
+    yolo_box: tuple[float, float, float, float],
+    max_ratio: float = 2.0,
+    tolerance_fraction: float = 0.06,
+    tolerance_floor: float = 30.0,
+) -> bool:
+    """Flag when the final crop isn't evenly centered on a confident YOLO box.
+
+    Two independent detections disagreeing is itself a strong signal, cheaper
+    and more reliable than either one's own confidence score (SAM 2's score
+    measures mask coherence, not whether the box matches the true board
+    extent - see SAM2_MASK_MIN_SCORE's docstring). Checked on every full_board
+    /side_profile crop with a usable YOLO box, not just the SAM 2 path, so a
+    regression anywhere in the boundary chain still gets caught.
+
+    ``crop`` is meant to be the RAW detected box, not a padded crop - padding
+    used to absorb ordinary cross-detector measurement noise here, which
+    meant generous padding could dilute a real disagreement away (measured:
+    a genuinely bled side_profile mask's margin ratio dropped from 2.47,
+    correctly flagged, to 1.68 at 80% padding). Checking the raw box fixes
+    that, but raw boxes from two independent detectors never align to the
+    pixel even when both are correct - measured on a real 72-photo
+    full_board batch, SAM 2's box was 0.1-5.0% narrower than YOLO's on
+    every single photo with no actual disagreement. ``tolerance_fraction``
+    absorbs that normal noise; ``tolerance_floor`` is a pixel minimum for
+    it, because side_profile boxes are only a couple hundred pixels wide
+    (board thickness, not board width) and the same measurement noise is a
+    much larger fraction of a small number - without the floor, genuinely
+    clean side_profile photos (e.g. IMG_6334: SAM2 1384-1606, YOLO
+    1359-1580, both within 26px of each other) got flagged too.
+    """
+    cx, cy, cw, ch = crop
+    bx1, by1, bx2, by2 = yolo_box
+    for near, far, span in ((bx1 - cx, (cx + cw) - bx2, cw), (by1 - cy, (cy + ch) - by2, ch)):
+        tolerance = max(span * tolerance_fraction, tolerance_floor)
+        if abs(near) <= tolerance and abs(far) <= tolerance:
+            continue  # both margins within ordinary cross-detector noise
+        if near < 0 or far < 0:
+            return True  # the crop doesn't even fully contain the YOLO box
+        low, high = min(near, far), max(near, far)
+        if low <= 0 < high:
+            return True  # one side has ~zero margin, the other real margin
+        if low > 0 and high / low > max_ratio:
+            return True
+    return False
+
+
+def usable_yolo_prompt_box(yolo: dict[str, object] | None, width: int, height: int, shot_type: str) -> tuple[float, float, float, float] | None:
+    """Return a confident YOLO detection as a SAM 2 prompt box, or None.
+
+    Shared by grouping (board_perimeter, so the persisted result already
+    reflects YOLO guidance) and cropping, so both phases agree on whether a
+    given photo's YOLO box is trustworthy enough to anchor SAM 2 to.
+    """
+    if not isinstance(yolo, dict):
+        return None
+    if not _usable_yolo_box(yolo, width, height, shot_type):
+        return None
+    if shot_type == "side_profile" and not _complete_profile_yolo_box(yolo, width, height):
+        return None
+    x, y, w, h = float(yolo["x"]), float(yolo["y"]), float(yolo["width"]), float(yolo["height"])
+    return x, y, x + w, y + h
+
+
+def yolo_cross_check_box(yolo: dict[str, object] | None, width: int, height: int, shot_type: str) -> tuple[float, float, float, float] | None:
+    """Return a YOLO detection box for cross-checking the final crop, or None.
+
+    Uses only _usable_yolo_box()'s height/aspect-ratio bar, not
+    usable_yolo_prompt_box()'s additional nose-to-tail span requirement -
+    see the call site in suggested_crop() for why those need different bars.
+    """
+    if not isinstance(yolo, dict) or not _usable_yolo_box(yolo, width, height, shot_type):
+        return None
+    x, y, w, h = float(yolo["x"]), float(yolo["y"]), float(yolo["width"]), float(yolo["height"])
+    return x, y, x + w, y + h
 
 
 def _contour_box_from_mask(mask: np.ndarray, original_shape: tuple[int, int], scale: float = 1.0) -> tuple[int, int, int, int] | None:
@@ -824,13 +1173,29 @@ def _best_candidate(mask: np.ndarray, shot_type: str, width: int, height: int) -
 def _full_board_crop(x: int, y: int, w: int, h: int, image_width: int, image_height: int, padding: float, rail_padding: float = DEFAULT_RAIL_PADDING) -> tuple[int, int, int, int]:
     """Crop with fixed board-relative margins on all four sides.
 
-    Both settings are proportions of detected board height.  There are no
-    image-frame minimums: the board boundary, not the camera frame, controls
-    the crop.  Clamping only occurs when the requested crop reaches the source
+    ``padding`` (nose/tail) is a proportion of detected board height;
+    ``rail_padding`` (left/right) is a proportion of detected board width -
+    each margin scales with the dimension it actually pads. Using height for
+    both used to inflate rail padding 5-10x on a typical photo, since board
+    height is always ~3000-4000px while width is often only 300-1000px.
+    A percentage of a board's own detected width still produces a smaller
+    absolute margin for a narrower board than a wider one, even within the
+    normal full_board range - real case (IMG_6480): an 803px-wide detection
+    (narrow end of the usual 800-1000px spread) got 201px of rail padding,
+    visibly tighter than wider boards at the same percentage. A floor
+    expressed as a fraction of the image's own width (not a raw pixel
+    count, so it scales with photo resolution) keeps the percentage in
+    control for normal-to-wide boards while guaranteeing narrower ones
+    still read as evenly margined.
+
+    There are no image-frame maximums beyond the explicit padding ceiling
+    above: the board boundary, not the camera frame, controls the crop.
+    Edge clamping only occurs when the requested crop reaches the source
     edge, and never invents pixels.
     """
     end_pad = min(max(1, round(h * padding)), max(0, y), max(0, image_height - (y + h)))
-    rail_pad = min(max(1, round(h * rail_padding)), max(0, x), max(0, image_width - (x + w)))
+    rail_floor = round(image_width * DEFAULT_RAIL_PADDING_FLOOR_FRACTION)
+    rail_pad = min(max(round(w * rail_padding), rail_floor), max(0, x), max(0, image_width - (x + w)))
     center = (x + w / 2) / image_width
     target_width = w + 2 * rail_pad
     target_height = h + 2 * end_pad
@@ -839,9 +1204,11 @@ def _full_board_crop(x: int, y: int, w: int, h: int, image_width: int, image_hei
     return _clamp_crop(left, top, target_width, target_height, image_width, image_height)
 
 
-def _profile_crop(x: int, y: int, w: int, h: int, image_width: int, image_height: int, padding: float) -> tuple[int, int, int, int]:
+def _profile_crop(x: int, y: int, w: int, h: int, image_width: int, image_height: int, padding: float, fins_confirmed: bool = False) -> tuple[int, int, int, int]:
     vertical_pad = min(max(1, round(h * padding)), max(0, y), max(0, image_height - (y + h)))
-    horizontal_pad = min(max(1, round(h * DEFAULT_HORIZONTAL_PADDING)), max(0, x), max(0, image_width - (x + w)))
+    horizontal_pct = DEFAULT_PROFILE_HORIZONTAL_PADDING_WITH_FINS if fins_confirmed else DEFAULT_PROFILE_HORIZONTAL_PADDING
+    horizontal_ceiling = round(image_width * DEFAULT_PROFILE_HORIZONTAL_PADDING_CEILING_FRACTION)
+    horizontal_pad = min(max(1, round(w * horizontal_pct)), horizontal_ceiling, max(0, x), max(0, image_width - (x + w)))
     # Center the output on the detected board body. The source frame can be
     # deliberately off-center because of a rack, neighboring board, or floor
     # space; those objects must not steer the listing crop.

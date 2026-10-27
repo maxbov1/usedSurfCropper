@@ -24,7 +24,7 @@ except ImportError:
 
 
 FIELDS = ("brand", "model", "fin_system", "fin_box_count", "fins_included", "fins_present_count")
-BOARD_EVIDENCE_VERSION = "0.1"
+BOARD_EVIDENCE_VERSION = "0.2-text-patches"
 SHOT_FIELD_ELIGIBILITY = {
     "card": set(FIELDS),
     # Full-board/deck views are the useful angle for markings and boxes.
@@ -80,6 +80,83 @@ def _crop_for_evidence(image: Image.Image, box: tuple[int, int, int, int]) -> Im
     return crop
 
 
+def board_text_patch_candidates(
+    image: Image.Image,
+    candidate: tuple[int, int, int, int] | None,
+    max_patches: int = 6,
+) -> list[tuple[int, int, int, int]]:
+    """Find compact text/logo-like patches strictly inside the board box.
+
+    This is a proposal step, not a text detector. MSER is useful here because
+    lettering and logos create stable high-contrast connected regions even
+    when the board itself is white. Every returned box is clipped to the
+    detected board, so room/background pixels cannot become identity evidence.
+    """
+    if cv2 is None or np is None or not candidate or len(candidate) != 4:
+        return []
+    x, y, width, height = (int(value) for value in candidate)
+    if width <= 4 or height <= 4:
+        return []
+    board = image.crop((x, y, x + width, y + height)).convert("RGB")
+    board.thumbnail((1400, 2200))
+    array = np.asarray(board)
+    gray = cv2.cvtColor(array, cv2.COLOR_RGB2GRAY)
+    scale_x = width / max(board.width, 1)
+    scale_y = height / max(board.height, 1)
+    area = float(board.width * board.height)
+    candidates: list[tuple[float, tuple[int, int, int, int]]] = []
+    try:
+        mser = cv2.MSER_create()
+        regions, _ = mser.detectRegions(gray)
+    except (AttributeError, cv2.error):
+        regions = []
+    for points in regions:
+        if len(points) < 5:
+            continue
+        px, py, pw, ph = cv2.boundingRect(points.reshape(-1, 1, 2))
+        fraction = (pw * ph) / max(area, 1.0)
+        if not 0.00002 <= fraction <= 0.08:
+            continue
+        if pw < 3 or ph < 3 or pw > board.width * 0.75 or ph > board.height * 0.22:
+            continue
+        # Expand just enough to capture the complete glyph/logo stroke.
+        pad_x, pad_y = max(3, round(pw * 0.35)), max(3, round(ph * 0.55))
+        left, top = max(0, px - pad_x), max(0, py - pad_y)
+        right, bottom = min(board.width, px + pw + pad_x), min(board.height, py + ph + pad_y)
+        patch = (
+            max(x, x + round(left * scale_x)),
+            max(y, y + round(top * scale_y)),
+            max(1, round((right - left) * scale_x)),
+            max(1, round((bottom - top) * scale_y)),
+        )
+        crop = gray[top:bottom, left:right]
+        if crop.size == 0:
+            continue
+        contrast = float(crop.std()) / 255.0
+        edges = cv2.Canny(crop, 45, 140)
+        edge_density = float(np.mean(edges > 0))
+        # Text-like patches are compact and contrasty. Prefer patches away
+        # from the extreme board boundary, where rails and shadows dominate.
+        interior = 1.0 if 0.03 < (px + pw / 2) / board.width < 0.97 and 0.02 < (py + ph / 2) / board.height < 0.98 else 0.35
+        score = (contrast * 0.55 + min(edge_density, 0.45) * 0.45) * interior
+        candidates.append((score, patch))
+    candidates.sort(key=lambda row: row[0], reverse=True)
+    selected: list[tuple[int, int, int, int]] = []
+    for _, patch in candidates:
+        px, py, pw, ph = patch
+        overlaps = False
+        for ox, oy, ow, oh in selected:
+            intersection = max(0, min(px + pw, ox + ow) - max(px, ox)) * max(0, min(py + ph, oy + oh) - max(py, oy))
+            if intersection / max(min(pw * ph, ow * oh), 1) > 0.55:
+                overlaps = True
+                break
+        if not overlaps:
+            selected.append(patch)
+        if len(selected) >= max_patches:
+            break
+    return selected
+
+
 def _patch_metrics(crop: Image.Image, region: str) -> dict[str, float | int | str]:
     """Describe a patch without pretending the heuristic is a detector."""
     if cv2 is None or np is None:
@@ -121,6 +198,7 @@ def extract_board_evidence(
     candidate: tuple[int, int, int, int] | None,
     shot_type: str,
     ocr_runner=None,
+    use_text_patches: bool = False,
 ) -> dict[str, object]:
     """Extract high-resolution, board-relative evidence for diagnostics.
 
@@ -134,11 +212,26 @@ def extract_board_evidence(
     evidence_regions = {}
     all_text = []
     errors = []
+    text_patches = board_text_patch_candidates(image, candidate) if use_text_patches else []
+    patch_records = []
+    if use_text_patches and ocr_runner is not None:
+        for box in text_patches:
+            crop = _crop_for_evidence(image, box)
+            try:
+                text, _, error = ocr_runner(crop)
+                if text:
+                    all_text.append(text)
+                if error:
+                    errors.append(f"text_patch: {error}")
+                patch_records.append({"box": list(box), "ocr_text": text, "ocr_passes": 1, "status": "error" if error else "ready"})
+            except Exception as exc:
+                errors.append(f"text_patch: {type(exc).__name__}: {exc}")
+                patch_records.append({"box": list(box), "ocr_text": "", "ocr_passes": 1, "status": "error"})
     for name, box in regions.items():
         crop = _crop_for_evidence(image, box)
         texts = []
         pass_count = 0
-        if ocr_runner is not None:
+        if ocr_runner is not None and not use_text_patches:
             variants = [crop, ImageOps.autocontrast(ImageOps.grayscale(crop)), ImageEnhance.Contrast(crop).enhance(1.8).filter(ImageFilter.SHARPEN)]
             for variant in variants:
                 pass_count += 1
@@ -151,7 +244,8 @@ def extract_board_evidence(
                 except Exception as exc:
                     errors.append(f"{name}: {type(exc).__name__}: {exc}")
         text = max(texts, key=lambda value: len(re.findall(r"[A-Za-z0-9]", value)), default="")
-        all_text.append(text)
+        if not use_text_patches:
+            all_text.append(text)
         evidence_regions[name] = {
             "box": list(box),
             "ocr_text": text,
@@ -164,7 +258,8 @@ def extract_board_evidence(
         "status": "ready",
         "regions": evidence_regions,
         "ocr_text": merged_text,
-        "ocr_passes": sum(int(item["ocr_passes"]) for item in evidence_regions.values()),
+        "ocr_passes": len(patch_records) if use_text_patches else sum(int(item["ocr_passes"]) for item in evidence_regions.values()),
+        "text_patches": patch_records,
         "errors": errors[:10],
     }
 

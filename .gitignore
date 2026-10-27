@@ -8,6 +8,7 @@ data/
 input/*
 output/*
 yolo11n.pt
+sam2.1_hiera_tiny.pt
 build/
 dist/
 .pyinstaller/

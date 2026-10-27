@@ -2,7 +2,12 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+if [[ -n "${USEDSURF_SAM2_CHECKPOINT:-}" && -x "$ROOT_DIR/.venv-sam2/bin/python" ]]; then
+  # SAM2 (torch + the sam2 package) only lives in .venv-sam2. Plain .venv
+  # cannot import it, so it would silently fall back to the OpenCV-only
+  # board detector with no error if picked instead while these are set.
+  PYTHON="$ROOT_DIR/.venv-sam2/bin/python"
+elif [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
   PYTHON="$ROOT_DIR/.venv/bin/python"
 elif [[ -x "$ROOT_DIR/.venv-sam2/bin/python" ]]; then
   PYTHON="$ROOT_DIR/.venv-sam2/bin/python"

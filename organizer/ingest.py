@@ -8,8 +8,9 @@ from pathlib import Path
 
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
-from .card_ocr import extract_card_identifier, extract_card_identifier_with_confidence
+from .card_ocr import extract_card_identifier, extract_card_identifier_with_confidence, ocr_quality
 from .board_evidence import evidence_fields_for_shot
+from .segmentation import board_perimeter, board_prompt_box, get_segmenter, mask_crop
 
 try:
     import cv2
@@ -30,24 +31,10 @@ except ImportError:
     pass
 
 SUPPORTED = {".jpg", ".jpeg", ".png", ".heic"}
-PROCESSING_VERSION = "0.24.0-board-region-evidence"
+PROCESSING_VERSION = "1.3.0-embedding-boundary-tiebreak"
 MAX_PHOTOS_PER_BOARD = 7
 STANDARD_BOARD_PHOTOS = 6
 SHOT_LIMITS = {"full_board": 4, "side_profile": 1, "fin_detail": 1, "card": 1}
-BOARD_SIMILARITY_BOUNDARY = 0.10
-LOCAL_NEIGHBOR_COUNT = 8
-LOCAL_TIME_WINDOW_SECONDS = 10 * 60
-CARD_MATCH_MAX_MINUTES = 8
-CARD_MATCH_MAX_VISUAL_DISTANCE = 0.35
-BOUNDARY_REFINEMENT_RADIUS = 3
-IDENTITY_ASSIGNMENT_MAX_DISTANCE = 0.42
-IDENTITY_ASSIGNMENT_MIN_MARGIN = 0.035
-IDENTITY_TRUSTED_DISTANCE = 0.27
-IDENTITY_RETRY_ROUNDS = 3
-IDENTITY_GROUP_MAX_DISTANCE = IDENTITY_ASSIGNMENT_MAX_DISTANCE
-IDENTITY_LOCAL_MAX_DISTANCE = 0.22
-QUARANTINE_CLUSTER_MAX_DISTANCE = IDENTITY_ASSIGNMENT_MAX_DISTANCE
-QUARANTINE_CLUSTER_MIN_SIZE = 2
 _LEARNED_BOARD_IDENTITY_WEIGHTS: dict[str, float] | None = None
 
 
@@ -121,6 +108,7 @@ def board_identity_signature(
     candidate: tuple[int, int, int, int] | None = None,
     shot_type: str = "",
     card_regions: list[tuple[int, int, int, int]] | None = None,
+    board_mask: "np.ndarray | None" = None,
 ) -> tuple[float, ...]:
     """Describe the board itself after normalizing away the room.
 
@@ -129,12 +117,21 @@ def board_identity_signature(
     normalized grayscale layout, edge/graphic layout, and coarse geometry.
     Geometry is kept as a small final section so a side profile can still be
     compared to the same board's full-board views without dominating identity.
+
+    ``board_mask`` (e.g. from SAM 2), if given, is a boolean array the same
+    size as ``image``. The candidate rectangle alone is not reliable: an
+    off-center board can leave the rectangle mostly background, and that
+    background then dominates the signature, so two unrelated boards shot
+    against the same studio wall score as near-identical. The mask, when
+    present, excludes non-board pixels from the crop before any feature is
+    computed.
     """
     if cv2 is None or np is None:
         return ()
     working = image.convert("RGB")
     width, height = working.size
     geometry = (0.0, 0.0, 0.0, 0.0)
+    crop_box: tuple[int, int, int, int] | None = None
     if candidate and len(candidate) == 4:
         x, y, box_width, box_height = (int(value) for value in candidate)
         if box_width > 2 and box_height > 2:
@@ -148,6 +145,7 @@ def board_identity_signature(
             right = min(width, x + box_width - inner_x)
             bottom = min(height, y + box_height - inner_y)
             working = working.crop((left, top, right, bottom))
+            crop_box = (left, top, right, bottom)
             geometry = (
                 box_width / max(width, 1),
                 box_height / max(height, 1),
@@ -160,12 +158,27 @@ def board_identity_signature(
         left, right = round(width * 0.16), round(width * 0.84)
         top, bottom = round(height * 0.08), round(height * 0.92)
         working = working.crop((left, top, right, bottom))
+        crop_box = (left, top, right, bottom)
     working.thumbnail((480, 640))
     # ``np.asarray(PIL.Image)`` may expose a read-only decoder buffer.  Card
     # masking below writes into this array, so always use a writable copy.
     array = np.asarray(working).copy()
     if array.size == 0:
         return ()
+    if board_mask is not None and crop_box is not None and tuple(board_mask.shape[:2]) == (height, width):
+        left, top, right, bottom = crop_box
+        cropped_mask = board_mask[top:bottom, left:right]
+        if cropped_mask.size:
+            resized_mask = cv2.resize(
+                cropped_mask.astype(np.uint8), (array.shape[1], array.shape[0]), interpolation=cv2.INTER_NEAREST
+            ).astype(bool)
+            # A real board can be a thin sliver of a loose/off-center crop
+            # (an edge-on full-board shot easily covers under 5% of its own
+            # candidate box), so the floor here is an absolute pixel count,
+            # not a share of the crop. Only an essentially-empty or
+            # essentially-everything mask is distrusted as a bad prediction.
+            if max(100, int(resized_mask.size * 0.002)) <= int(resized_mask.sum()) < resized_mask.size * 0.98:
+                array[~resized_mask] = 128
     # Inventory cards are identity anchors, not board identity. Mask their
     # pixels after the board crop so a yellow card cannot make two unrelated
     # boards look alike (or make the same board look different by lighting).
@@ -206,6 +219,7 @@ def board_local_signature(
     candidate: tuple[int, int, int, int] | None = None,
     shot_type: str = "",
     card_regions: list[tuple[int, int, int, int]] | None = None,
+    board_mask: "np.ndarray | None" = None,
 ) -> tuple[float, ...]:
     """Capture local board evidence that whole-board averages erase.
 
@@ -213,6 +227,11 @@ def board_local_signature(
     unrelated white boards look alike. These fixed board-relative patches keep
     rail color, nose/deck markings, tail traction, fin-box layout, and local
     edge texture separate. Profiles intentionally do not get this signature.
+
+    ``board_mask`` behaves as in ``board_identity_signature``: when given, it
+    blanks non-board pixels before the rail/nose/center/tail regions are
+    sampled, so a loose candidate box that is mostly background wall does not
+    get reported as this board's rail or deck color.
     """
     if cv2 is None or np is None or shot_type == "side_profile" or not candidate:
         return ()
@@ -224,6 +243,12 @@ def board_local_signature(
     if board.size == 0:
         return ()
     board = cv2.resize(board, (48, 128), interpolation=cv2.INTER_AREA)
+    if board_mask is not None and tuple(board_mask.shape[:2]) == source.shape[:2]:
+        cropped_mask = board_mask[max(0, y):min(source.shape[0], y + height), max(0, x):min(source.shape[1], x + width)]
+        if cropped_mask.size:
+            resized_mask = cv2.resize(cropped_mask.astype(np.uint8), (48, 128), interpolation=cv2.INTER_NEAREST).astype(bool)
+            if 0.05 <= float(resized_mask.mean()) < 0.98:
+                board[~resized_mask] = 128
     if card_regions:
         for rx, ry, rw, rh in card_regions:
             left = max(0, round((int(rx) - x) * 48 / max(width, 1)))
@@ -263,6 +288,45 @@ def board_local_signature(
             float(np.count_nonzero(edges) / max(edges.size, 1)),
         ])
     return tuple(values)
+
+
+def board_region_mask(
+    image: Image.Image,
+    candidate: tuple[int, int, int, int] | None,
+    shot_type: str,
+) -> "np.ndarray | None":
+    """Return a full-image boolean board mask from SAM 2, or None.
+
+    Lazy and optional: with no SAM 2 checkpoint configured (``get_segmenter``
+    returns None, the default today) this is a no-op, and callers fall back
+    to the candidate rectangle alone — identical to behavior before this
+    function existed. When SAM 2 is configured, its mask is what lets
+    ``board_identity_signature``/``board_local_signature`` describe the
+    board itself rather than whatever a loose, off-center rectangle happened
+    to include (see their docstrings for why that matters).
+    """
+    result = board_perimeter(image, shot_type)
+    return result["mask"] if result else None
+
+
+def board_mask_width_fraction(mask: "np.ndarray") -> float | None:
+    """Return the true board's width as a fraction of the frame width.
+
+    Uses the largest connected component of the mask, not its raw bounding
+    box: a few stray false-positive pixels elsewhere in the frame (a pipe,
+    a shadow) can otherwise make a genuinely narrow, standing-edge-on board
+    look as wide as the whole image.
+    """
+    if cv2 is None or np is None or mask is None:
+        return None
+    height, width = mask.shape[:2]
+    if not width:
+        return None
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8))
+    if count <= 1:
+        return None
+    index = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    return float(stats[index, cv2.CC_STAT_WIDTH]) / width
 
 
 def _board_identity_distance(left: tuple[float, ...], right: tuple[float, ...]) -> float:
@@ -533,21 +597,40 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def exif_capture_time(image: Image.Image) -> str | None:
+def exif_capture_metadata(image: Image.Image) -> tuple[str | None, str]:
+    """Return the capture time and the exact metadata source used.
+
+    File ordering and filesystem mtimes are not capture evidence.  Keeping the
+    source beside the parsed value makes a missing/ambiguous timestamp visible
+    in diagnostics instead of silently turning it into a temporal prior.
+    """
     exif = image.getexif()
-    raw = exif.get(36867) or exif.get(36868) or exif.get(306)
-    if not raw:
-        return None
-    try:
-        return datetime.strptime(str(raw), "%Y:%m:%d %H:%M:%S").isoformat(sep=" ")
-    except ValueError:
-        return None
+    for tag, source in (
+        (36867, "exif_datetime_original"),
+        (36868, "exif_datetime_digitized"),
+        (306, "exif_datetime"),
+    ):
+        raw = exif.get(tag)
+        if not raw:
+            continue
+        try:
+            return datetime.strptime(str(raw), "%Y:%m:%d %H:%M:%S").isoformat(sep=" "), source
+        except ValueError:
+            return None, f"{source}_invalid"
+    return None, "missing"
+
+
+def exif_capture_time(image: Image.Image) -> str | None:
+    return exif_capture_metadata(image)[0]
 
 
 def read_image(path: Path) -> tuple[Image.Image, str | None]:
     with Image.open(path) as opened:
-        capture = exif_capture_time(opened)
-        return ImageOps.exif_transpose(opened).convert("RGB"), capture
+        capture, source = exif_capture_metadata(opened)
+        converted = ImageOps.exif_transpose(opened).convert("RGB")
+        # Preserve this without changing the long-standing read_image API.
+        converted.info["usedsurf_capture_time_source"] = source
+        return converted, capture
 
 
 def ocr_runtime_status() -> dict[str, str | bool]:
@@ -562,7 +645,7 @@ def ocr_runtime_status() -> dict[str, str | bool]:
         return {"available": False, "status": "binary_missing_or_unusable", "error": f"{type(exc).__name__}: {exc}"}
 
 
-def local_ocr(image: Image.Image, region: tuple[int, int, int, int] | None = None) -> tuple[str, dict[str, str], str]:
+def local_ocr(image: Image.Image, region: tuple[int, int, int, int] | None = None, fast: bool = False) -> tuple[str, dict[str, str], str]:
     if pytesseract is None:
         return "", {}, "pytesseract is not installed"
     _configure_tesseract_binary()
@@ -578,27 +661,33 @@ def local_ocr(image: Image.Image, region: tuple[int, int, int, int] | None = Non
             variants = []
             for card in cards:
                 card.thumbnail((1800, 1800))
-                variants.extend([card, card.crop((round(card.width * 0.47), 0, card.width, round(card.height * 0.62)))])
+                variants.append(card)
+                if not fast:
+                    variants.append(card.crop((round(card.width * 0.47), 0, card.width, round(card.height * 0.62))))
         else:
             image = image.copy()
             image.thumbnail((1200, 1200))
             width, height = image.size
-            variants = [
-                image,
-                image.crop((0, round(height * 0.18), width, round(height * 0.86))),
-                image.crop((round(width * 0.10), round(height * 0.22), round(width * 0.90), round(height * 0.78))),
-            ]
+            variants = [image]
+            if not fast:
+                variants.extend([
+                    image.crop((0, round(height * 0.18), width, round(height * 0.86))),
+                    image.crop((round(width * 0.10), round(height * 0.22), round(width * 0.90), round(height * 0.78))),
+                ])
         texts = []
         for variant in variants:
-            texts.append(pytesseract.image_to_string(variant, config="--psm 6"))
-            texts.append(pytesseract.image_to_string(ImageOps.autocontrast(ImageOps.grayscale(variant)), config="--psm 11"))
+            if fast:
+                texts.append(pytesseract.image_to_string(variant, config="--psm 11"))
+            else:
+                texts.append(pytesseract.image_to_string(variant, config="--psm 6"))
+                texts.append(pytesseract.image_to_string(ImageOps.autocontrast(ImageOps.grayscale(variant)), config="--psm 11"))
         text = max(texts, key=_ocr_signal_score, default="")
     except Exception as exc:
         return "", {}, f"{type(exc).__name__}: {exc}"
     return text, extract_card_identifier(texts), ""
 
 
-def board_ocr(image: Image.Image, candidate: tuple[int, int, int, int] | None = None) -> tuple[str, dict[str, str], str]:
+def board_ocr(image: Image.Image, candidate: tuple[int, int, int, int] | None = None, fast: bool = False) -> tuple[str, dict[str, str], str]:
     """Read board markings from board-relative crops, not the room.
 
     Full-frame OCR mostly sees wall seams and produces no useful brand/model
@@ -617,12 +706,13 @@ def board_ocr(image: Image.Image, candidate: tuple[int, int, int, int] | None = 
             crop = image.copy()
         crop.thumbnail((1800, 2400))
         width, height = crop.size
-        variants = [
-            crop,
-            crop.crop((0, 0, width, round(height * 0.58))),
-            crop.crop((0, round(height * 0.42), width, height)),
-            ImageEnhance.Contrast(crop).enhance(1.7).filter(ImageFilter.SHARPEN),
-        ]
+        variants = [crop]
+        if not fast:
+            variants.extend([
+                crop.crop((0, 0, width, round(height * 0.58))),
+                crop.crop((0, round(height * 0.42), width, height)),
+                ImageEnhance.Contrast(crop).enhance(1.7).filter(ImageFilter.SHARPEN),
+            ])
         texts = [pytesseract.image_to_string(variant, config="--psm 11") for variant in variants]
         text = max(texts, key=_ocr_signal_score, default="")
         return text, extract_card_identifier(texts), ""
@@ -806,6 +896,104 @@ def _rectify_card(image: Image.Image, region: tuple[int, int, int, int]) -> Imag
     return Image.fromarray(warped)
 
 
+def _densest_text_cluster(
+    boxes: list[tuple[int, int, int, int]], pad: float, min_words: int = 4,
+) -> tuple[int, int, int, int] | None:
+    """Return the bounding box of the largest cluster of nearby word boxes.
+
+    Pure geometry, no OCR — kept separate from ``locate_card_region_by_text``
+    so the clustering itself is directly testable without pytesseract. Two
+    boxes (padded by ``pad``) join the same cluster when they overlap; the
+    cluster with the most words wins. A handful of stray hits (a sponsor
+    logo word, a wall scuff read as a character) is noise, not a card, so a
+    cluster smaller than ``min_words`` is rejected rather than returned.
+    """
+    if len(boxes) < min_words:
+        return None
+    parent = list(range(len(boxes)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    def overlaps(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+        ax0, ay0, ax1, ay1 = a[0] - pad, a[1] - pad, a[0] + a[2] + pad, a[1] + a[3] + pad
+        bx0, by0, bx1, by1 = b[0] - pad, b[1] - pad, b[0] + b[2] + pad, b[1] + b[3] + pad
+        return ax0 < bx1 and ax1 > bx0 and ay0 < by1 and ay1 > by0
+
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            if overlaps(boxes[i], boxes[j]):
+                union(i, j)
+    groups: dict[int, list[tuple[int, int, int, int]]] = {}
+    for index, box in enumerate(boxes):
+        groups.setdefault(find(index), []).append(box)
+    best = max(groups.values(), key=len)
+    if len(best) < min_words:
+        return None
+    x0 = min(box[0] for box in best)
+    y0 = min(box[1] for box in best)
+    x1 = max(box[0] + box[2] for box in best)
+    y1 = max(box[1] + box[3] for box in best)
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def locate_card_region_by_text(image: Image.Image) -> tuple[int, int, int, int] | None:
+    """Find the inventory card by where the dense printed text is, not by
+    color.
+
+    The color-based detector (``card_candidate``) looks for a yellow,
+    saturated patch — but it can't tell a small yellow card apart from a
+    yellow board it's taped to; the whole frame reads as one yellow blob.
+    A full-board photo has exactly one object with dense printed text,
+    though: the card. This clusters OCR word boxes from a full-frame pass
+    (see ``_densest_text_cluster``) and returns the bounding box of the
+    densest one. It is color-blind by construction, so it works the same
+    whether the board underneath is yellow, white, or anything else.
+    """
+    if pytesseract is None:
+        return None
+    _configure_tesseract_binary()
+    try:
+        working = image.convert("RGB")
+        scale = min(1.0, 1200 / max(working.width, working.height))
+        if scale < 1.0:
+            working = working.resize((round(working.width * scale), round(working.height * scale)))
+        data = pytesseract.image_to_data(working, config="--psm 11", output_type=pytesseract.Output.DICT)
+    except Exception:
+        return None
+    boxes: list[tuple[int, int, int, int]] = []
+    for text, conf, x, y, w, h in zip(
+        data.get("text", []), data.get("conf", []), data.get("left", []),
+        data.get("top", []), data.get("width", []), data.get("height", []),
+    ):
+        try:
+            confidence = float(conf)
+        except (TypeError, ValueError):
+            confidence = -1.0
+        if len((text or "").strip()) < 2 or confidence < 40 or w <= 0 or h <= 0:
+            continue
+        boxes.append((x, y, w, h))
+    cluster = _densest_text_cluster(boxes, pad=max(working.width, working.height) * 0.02)
+    if cluster is None:
+        return None
+    x0, y0, cw, ch = cluster
+    inv_scale = 1.0 / scale if scale < 1.0 else 1.0
+    return (
+        max(0, round(x0 * inv_scale)),
+        max(0, round(y0 * inv_scale)),
+        round(cw * inv_scale),
+        round(ch * inv_scale),
+    )
+
+
 def card_candidate(image: Image.Image) -> tuple[int, int, int, int, float] | None:
     """Find likely yellow inventory-card regions on a small working image.
 
@@ -904,31 +1092,27 @@ def card_signal(text: str, identifier: dict[str, str]) -> bool:
     return sum(field in words for field in fields) >= 2
 
 
-def scan_files(input_dir: Path, cache: dict[str, dict] | None = None) -> list[dict]:
+def scan_files(input_dir: Path, progress=None) -> list[dict]:
+    """Scan and analyze every photo in ``input_dir`` fresh, every time.
+
+    No cache: this app's real usage never reprocesses the same batch twice
+    (a batch is grouped, reviewed, and archived once), so a hash-keyed
+    cache only added complexity and a real failure mode — a stale entry
+    can survive a file rename and silently hand back another photo's
+    analysis under the new name.
+    """
     found = []
     ocr_status = ocr_runtime_status()
-    for path in sorted(input_dir.iterdir()):
-        if not path.is_file() or path.suffix.lower() not in SUPPORTED:
-            continue
+    paths = [
+        path for path in sorted(input_dir.iterdir())
+        if path.is_file() and path.suffix.lower() in SUPPORTED
+    ]
+    total = len(paths)
+    for index, path in enumerate(paths, start=1):
         try:
             content_hash = sha256(path)
-            cached = (cache or {}).get(content_hash)
-            if cached and cached.get("cache_version") == PROCESSING_VERSION and cached.get("complete"):
-                restored = dict(cached)
-                restored.pop("cache_version", None)
-                restored.pop("complete", None)
-                restored["path"] = path
-                restored["hash"] = content_hash
-                restored["_processing_cache_hit"] = True
-                for key in ("visual_signature", "board_identity_signature", "board_local_signature"):
-                    if isinstance(restored.get(key), list):
-                        restored[key] = tuple(restored[key])
-                for key in ("card_candidate", "board_candidate"):
-                    if isinstance(restored.get(key), list):
-                        restored[key] = tuple(restored[key])
-                found.append(restored)
-                continue
             image, capture = read_image(path)
+            capture_source = str(image.info.get("usedsurf_capture_time_source", "missing"))
             candidate = card_candidate(image)
             # Broad edge proposals can accidentally describe the entire
             # board/frame. They are useful diagnostics, but not card regions:
@@ -944,6 +1128,25 @@ def scan_files(input_dir: Path, cache: dict[str, dict] | None = None) -> list[di
                     and region[1] + region[3] < image.height * 0.98
                 )
             ]
+            # Color-based card detection fails outright when the board
+            # itself is the card's color (a yellow board makes the whole
+            # frame one yellow blob, same as the card taped to it). Text
+            # density doesn't have that blind spot: the card is the only
+            # object in a full-board photo with dense printed fields. When
+            # SAM 2 is configured its mask tightens this into a precise
+            # card boundary; otherwise the raw text cluster is still a far
+            # better OCR crop than guessing from color.
+            text_region = locate_card_region_by_text(image)
+            if text_region is not None:
+                segmenter = get_segmenter()
+                if segmenter is not None:
+                    tx, ty, tw, th = text_region
+                    result = segmenter.predict(image, (float(tx), float(ty), float(tx + tw), float(ty + th)))
+                    if result.mask is not None:
+                        tightened = mask_crop(result.mask, image.width, image.height, padding=0.08)
+                        if tightened is not None:
+                            text_region = tightened
+                card_regions = card_regions + [text_region]
             yellow_score = yellow_card_score(image)
             candidate_is_card = False
             if candidate:
@@ -951,13 +1154,24 @@ def scan_files(input_dir: Path, cache: dict[str, dict] | None = None) -> list[di
                 # A real card is a substantial interior rectangle. Long warm
                 # floor/rail edges and yellow board graphics usually touch an
                 # image edge or are too short to satisfy this test.
-                candidate_is_card = (
-                    candidate_score >= 1.05
-                    and 0.08 * image.width < cx < 0.78 * image.width
-                    and 0.18 * image.height < cy < 0.70 * image.height
+                within_frame_horizontally = (
+                    0.08 * image.width < cx < 0.78 * image.width
                     and 0.12 * image.width < cw < 0.70 * image.width
+                )
+                within_frame_vertically = (
+                    0.18 * image.height < cy < 0.70 * image.height
                     and 0.16 * image.height < ch < 0.62 * image.height
                     and cy + ch < 0.92 * image.height
+                )
+                # A card held close to the camera can clip the top or bottom
+                # margin on its own; an overwhelming yellow fraction (nothing
+                # else in this capture protocol produces that much yellow
+                # coverage) is strong enough evidence to skip that specific
+                # check rather than silently drop a well-read card.
+                candidate_is_card = (
+                    candidate_score >= 1.05
+                    and within_frame_horizontally
+                    and (within_frame_vertically or yellow_score >= 0.35)
                 )
             # Avoid running Tesseract on every warm wall edge or board logo.
             # OCR is reserved for a plausible interior card or a strong yellow
@@ -991,20 +1205,28 @@ def scan_files(input_dir: Path, cache: dict[str, dict] | None = None) -> list[di
                     if region_error and not ocr_error:
                         ocr_error = region_error
                 field_evidence = extract_card_identifier_with_confidence(card_texts)
-                per_file_ocr_status = "read" if identifier else ("empty" if not ocr_error else "error")
+                quality = ocr_quality(text, identifier)
+                per_file_ocr_status = "read" if quality["status"] == "usable" else ("empty" if not ocr_error else "error")
             else:
                 text, identifier, ocr_error, field_evidence = "", {}, "", {}
                 per_file_ocr_status = "not_run"
             largest_card_fraction = max((region[2] * region[3] for region in card_regions), default=0) / max(image.width * image.height, 1)
-            has_card_evidence = bool(card_regions and (
+            has_card_evidence = bool(
                 identifier
                 or any(word in text.lower() for word in ("board information", "fin system", "brand", "model", "item"))
-                or largest_card_fraction >= 0.015
-            )) or candidate_is_card
-            # OCR from a full board frequently finds words such as "model"
-            # or "brand" in logos and graphics. It is only standalone-card
-            # evidence when paired with a compact card proposal.
-            compact_card_ocr = bool(card_regions and largest_card_fraction <= 0.45 and card_signal(text, identifier))
+                or (card_regions and largest_card_fraction >= 0.015)
+            ) or candidate_is_card
+            # OCR from a full board frequently finds words such as "model" or
+            # "brand" in logos and graphics, so a bare keyword hit alone is
+            # not standalone-card evidence. `card_signal` is already the
+            # strict gate against that false positive (a SKU, or 2+ of
+            # item/brand/model) and must not additionally depend on the
+            # separate contour-based `card_regions` detector agreeing — a
+            # card photographed at an angle or cropped at the frame edge can
+            # read perfectly (SKU and all) while that detector finds nothing,
+            # which previously meant a clearly-identified card was silently
+            # demoted to full_board/side_profile and never anchored a group.
+            compact_card_ocr = card_signal(text, identifier) and (not card_regions or largest_card_fraction <= 0.45)
             standalone_card = candidate_is_card or compact_card_ocr
             # A readable card mounted on a board is an anchor, not a separate
             # card frame. Only promote a frame to ``is_card`` when the card
@@ -1015,6 +1237,7 @@ def scan_files(input_dir: Path, cache: dict[str, dict] | None = None) -> list[di
             found.append({
                 "path": path, "hash": content_hash, "capture": capture, "width": image.width,
                 "height": image.height, "ocr": text, "identifier": identifier,
+                "capture_source": capture_source,
                 "card_candidate": candidate[:4] if candidate else None,
                 "card_confidence": candidate[4] if candidate else 0.0,
                 "card_regions": card_regions,
@@ -1022,6 +1245,7 @@ def scan_files(input_dir: Path, cache: dict[str, dict] | None = None) -> list[di
                 "card_field_evidence": field_evidence,
                 "yellow_card_score": yellow_score,
                 "ocr_status": per_file_ocr_status,
+                "ocr_quality": quality,
                 "ocr_error": ocr_error,
                 "ocr_runtime": ocr_status,
                 "visual_signature": visual_signature(image),
@@ -1029,874 +1253,92 @@ def scan_files(input_dir: Path, cache: dict[str, dict] | None = None) -> list[di
             })
         except Exception as exc:
             found.append({"path": path, "error": str(exc), "capture": None, "width": None, "height": None, "ocr": "", "identifier": {}, "ocr_status": "scan_error", "ocr_error": "", "ocr_runtime": ocr_status, "is_card": False, "visual_signature": ()})
+        if progress:
+            progress(index, total, path.name, cached=False)
     # Stable tie-breaker is filename, but capture time remains primary.
     return sorted(found, key=lambda item: (item["capture"] is None, item["capture"] or "", item["path"].name.lower()))
 
 
 def group_scanned(files: list[dict]) -> list[list[dict]]:
-    """Group photos by visual runs, using cards as identity anchors.
+    """Group photos by capture order, anchored to inventory cards.
 
-    The card count is a validation signal, not a reason to manufacture a
-    merge or split. A weak card/cluster match remains a visible review item.
+    The capture protocol is fixed and the input is human-curated: a card
+    photo, then that board's photos, in that order, until the next card.
+    Trusting that order *is* the algorithm. Earlier versions tried to
+    confirm or override it with visual similarity (color histograms, then
+    masked histograms, then SAM 2 masks) — every version of that produced
+    real cross-board contamination in production, because a confused visual
+    match only had to be marginally more confident than the right answer to
+    win, not actually correct. No visual signal is used to second-guess
+    capture order here.
+
+    A run of photos with no card at all (before the first detected card, or
+    an entire batch with no cards) stays one group for a human to assign,
+    rather than being auto-split by a visual-similarity guess.
     """
     if not files:
         return []
     for index, item in enumerate(files):
         item.setdefault("_sequence_index", index)
-    cards = [item for item in files if is_card_anchor(item)]
-    board_photos = [item for item in files if not item.get("is_card")]
-    if not cards:
-        return _cluster_board_photos(board_photos)
-    # Once the classifier has produced board-identity values, do not let the
-    # old chronological lane splitter own a photo. Cards still determine the
-    # expected number of groups, but identity evidence makes the assignment
-    # globally. The visual-signature fallback keeps older scan-only callers
-    # and small fixtures compatible.
-    if any(item.get("board_identity_signature") for item in board_photos):
-        return _group_from_global_identity(files, cards, board_photos)
-    return _group_from_card_lanes(files, cards, board_photos)
-
-
-def _seed_card_lanes(cards: list[dict], photos: list[dict]) -> list[list[dict]]:
-    """Create soft initial seeds; these are never treated as ownership."""
-    ordered_cards = sorted(cards, key=lambda item: item.get("_sequence_index", 0))
-    ordered_photos = sorted(photos, key=lambda item: item.get("_sequence_index", 0))
-    card_keys = [_card_order_key(card) for card in ordered_cards]
-    photo_keys = [_card_order_key(photo) for photo in ordered_photos]
-    boundaries = []
-    for left, right in zip(card_keys, card_keys[1:]):
-        midpoint = (left + right) / 2.0
-        # A boundary is a count of photos on the left, not the index of the
-        # nearest photo. Using the nearest index split immediately before a
-        # photo that was just left of the midpoint, which moved the final
-        # side/profile frame into the following board.
-        midpoint_boundary = sum(1 for key in photo_keys if key <= midpoint)
-        boundaries.append(_refine_lane_boundary(ordered_photos, midpoint_boundary))
-    lanes = []
-    start = 0
-    for boundary in sorted(max(0, min(len(ordered_photos), value)) for value in boundaries):
-        boundary = max(start, boundary)
-        lanes.append(ordered_photos[start:boundary])
-        start = boundary
-    lanes.append(ordered_photos[start:])
-    return lanes[:len(ordered_cards)] + [[] for _ in range(max(0, len(ordered_cards) - len(lanes)))]
-
-
-def _card_bridge_seeds(cards: list[dict], lanes: list[list[dict]]) -> list[dict | None]:
-    """Choose one nearby full-board bridge for each immutable card slot.
-
-    An inventory card is not a full-board image. It is an identity anchor with
-    a partial deck view. The first full-board frame in that card's local lane
-    is therefore the safest visual bridge; later grouping must grow from that
-    bridge instead of asking a generic board cluster to claim the card after
-    the fact. A visual tie-breaker is useful, but capture order remains the
-    primary protocol signal because the card is normally photographed before
-    its board views.
-    """
-    ordered_cards = sorted(cards, key=lambda item: item.get("_sequence_index", 0))
-    bridges: list[dict | None] = []
-    for card, lane in zip(ordered_cards, lanes):
-        candidates = [
-            photo for photo in lane
-            if not photo.get("is_card")
-            and photo.get("shot_type") == "full_board"
-            and photo.get("board_identity_signature")
-            and not _photo_identity_conflicts(photo, card, ordered_cards)
-        ]
-        if not candidates:
-            bridges.append(None)
+    ordered = sorted(files, key=lambda item: item.get("_sequence_index", 0))
+    groups: list[list[dict]] = []
+    current: list[dict] | None = None
+    for item in ordered:
+        if is_card_anchor(item):
+            current = [item]
+            groups.append(current)
             continue
-        card_index = card.get("_sequence_index")
-        def bridge_key(photo: dict) -> tuple[float, float, int]:
-            photo_index = photo.get("_sequence_index")
-            sequence_distance = abs((photo_index or 0) - (card_index or 0))
-            before_penalty = 0.0 if photo_index is None or card_index is None or photo_index >= card_index else 0.5
-            affinity = card_visual_affinity(card, [photo])
-            return before_penalty, sequence_distance + (affinity or 0.0) * 0.25, photo_index or 0
-        bridge = min(candidates, key=bridge_key)
-        bridge["identity_assignment_reason"] = "card_bridge_seed"
-        bridge["card_bridge_source"] = str(card.get("path", ""))
-        bridges.append(bridge)
-    return bridges
-
-
-def _identity_representatives(cluster: list[dict], limit: int = 4) -> list[dict]:
-    if len(cluster) <= limit:
-        return cluster
-    ranked = sorted(
-        cluster,
-        key=lambda item: _median([visual_distance(item, other) for other in cluster]),
-    )
-    return ranked[:limit]
-
-
-def _identity_text_key(value: object) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
-
-
-def _identity_value_matches(expected: object, actual: object) -> bool:
-    expected_key = _identity_text_key(expected)
-    actual_key = _identity_text_key(actual)
-    return bool(expected_key and actual_key and (expected_key in actual_key or actual_key in expected_key))
-
-
-def _side_profile_neighbor_lanes(photo: dict, cards: list[dict], count: int) -> list[int]:
-    """Return the card-backed lanes immediately before and after a profile."""
-    if not cards or count <= 0:
-        return []
-    photo_key = _card_order_key(photo)
-    ordered = [(_card_order_key(card), index) for index, card in enumerate(cards[:count])]
-    before = [index for key, index in ordered if key <= photo_key]
-    after = [index for key, index in ordered if key > photo_key]
-    candidates = []
-    if before:
-        candidates.append(before[-1])
-    if after:
-        candidates.append(after[0])
-    return candidates
-
-
-def _photo_identity_conflicts(photo: dict, card: dict, all_cards: list[dict]) -> list[str]:
-    """Return only explicit contradictions; missing fields are never negative."""
-    expected = card.get("identifier") or {}
-    evidence = photo.get("identity_evidence") or {}
-    conflicts: list[str] = []
-    eligible = evidence_fields_for_shot(str(photo.get("shot_type", "")))
-    for field in ("brand", "model", "fin_system", "fin_box_count", "fins_included", "fins_present_count"):
-        if field not in eligible:
-            continue
-        wanted = expected.get(field)
-        observed = (evidence.get(field) or {}).get("value")
-        if wanted and observed and not _identity_value_matches(wanted, observed):
-            conflicts.append(field)
-
-    # Some board photos expose a logo/model to OCR without the `BRAND:` or
-    # `MODEL:` label. Treat another card's explicit value as a contradiction,
-    # but only when the target card's value is not also present in the text.
-    text = _identity_text_key(photo.get("photo_ocr_text", ""))
-    if text:
-        target_values = [expected.get(field, "") for field in ("brand", "model") if field in eligible]
-        target_seen = any(_identity_text_key(value) in text for value in target_values if value)
-        if not target_seen:
-            for other in all_cards:
-                if other is card:
-                    continue
-                other_identifier = other.get("identifier") or {}
-                for field in ("brand", "model"):
-                    if field not in eligible:
-                        continue
-                    value = other_identifier.get(field, "")
-                    key = _identity_text_key(value)
-                    if key and len(key) >= 4 and key in text:
-                        conflicts.append(f"{field}:other-card")
-                        break
-    return sorted(set(conflicts))
-
-
-def _identity_candidate_key(item: dict) -> tuple[int, float, int]:
-    """Prefer reliable board views, then stable capture order."""
-    shot_type = str(item.get("shot_type") or "")
-    # Full-board views expose the most identity information. Other views are
-    # still useful retries, but must not define the first prototype.
-    shot_priority = {"full_board": 0, "fin_detail": 1, "side_profile": 2}.get(shot_type, 3)
-    return shot_priority, _card_order_key(item), int(item.get("_sequence_index", 0))
-
-
-def _identity_medoid(items: list[dict]) -> dict | None:
-    """Return the most central item without averaging unlike board views."""
-    if not items:
-        return None
-    return min(
-        items,
-        key=lambda candidate: _median([
-            visual_distance(candidate, other)
-            for other in items
-            if other is not candidate
-        ]),
-    )
-
-
-def _trusted_identity_members(lane: list[dict]) -> list[dict]:
-    """Select a small clean seed set from a soft timestamp lane.
-
-    The lane is only a search window. It is never itself a group. A prototype
-    is made from the central, mutually coherent full-board views, so an
-    adjacent board cannot poison the group's identity during the first pass.
-    """
-    candidates = [
-        item for item in lane
-        if not item.get("is_card") and item.get("board_identity_signature")
-    ]
-    if not candidates:
-        return []
-    full_boards = [item for item in candidates if item.get("shot_type") == "full_board"]
-    pool = full_boards or candidates
-    medoid = _identity_medoid(pool)
-    if medoid is None:
-        return []
-    ranked = sorted(
-        ((visual_distance(item, medoid), item) for item in pool),
-        key=lambda pair: (pair[0], _identity_candidate_key(pair[1])),
-    )
-    trusted = []
-    seen_signatures: set[tuple[object, ...]] = set()
-    for distance, item in ranked:
-        signature_key = (
-            str(item.get("shot_type") or ""),
-            tuple(item.get("board_identity_signature") or ()),
-        )
-        # Identical same-angle values do not provide independent evidence. A
-        # single seed prevents an ambiguous duplicate at a card boundary from
-        # becoming falsely trusted simply because it is visually identical.
-        if signature_key in seen_signatures:
-            continue
-        seen_signatures.add(signature_key)
-        if distance <= IDENTITY_TRUSTED_DISTANCE:
-            trusted.append(item)
-        if len(trusted) >= 4:
-            break
-    # A single unusually framed board may not have two close views. One
-    # central full-board view is still a valid seed; it is marked weak and is
-    # never enough to override an explicit identity contradiction.
-    if not trusted:
-        trusted = [ranked[0][1]]
-    return trusted
-
-
-def _identity_representative_score(photo: dict, representatives: list[dict]) -> float:
-    """Score against trusted views, preferring the closest compatible view."""
-    if not representatives:
-        return 1.0
-    distances = sorted(visual_distance(photo, representative) for representative in representatives)
-    # The closest view handles a painted back/rail/fin angle. The median keeps
-    # a single accidental near-match from dominating when more views exist.
-    closest = distances[0]
-    median = _median(distances[: min(3, len(distances))])
-    return closest * 0.65 + median * 0.35
-
-
-def _identity_admission(
-    photo: dict,
-    cluster: list[dict],
-    representatives: list[dict],
-) -> tuple[bool, float, str]:
-    """Apply the hard board-identity admission rule.
-
-    A candidate is never accepted merely because it is the least-bad option.
-    It must be compatible with the frozen representatives of the group. The
-    candidate is also checked against the group's central member so a single
-    accidental near-match cannot poison the group.
-    """
-    if not representatives:
-        return False, 1.0, "no_trusted_representative"
-    distances = sorted(visual_distance(photo, representative) for representative in representatives)
-    score = _identity_representative_score(photo, representatives)
-    medoid = _identity_medoid(representatives)
-    medoid_distance = visual_distance(photo, medoid) if medoid else 1.0
-    # Side profiles are an intentional protocol exception: their narrow
-    # silhouette is not a reliable appearance signature. They are admitted
-    # only from the neighboring chronological card lanes, whose temporal
-    # routing is enforced by _retry_group_candidates(). Full-board and fin
-    # photos still require visual identity compatibility.
-    if photo.get("shot_type") == "side_profile":
-        return True, 0.0, "side_profile_temporal_neighbor"
-    if photo.get("shot_type") == "full_board":
-        admitted = (
-            distances[0] <= IDENTITY_GROUP_MAX_DISTANCE
-            and medoid_distance <= IDENTITY_GROUP_MAX_DISTANCE
-        )
-        local_signature = photo.get("board_local_signature") or ()
-        if local_signature:
-            local_distances = [
-                float(np.mean(np.abs(
-                    np.asarray(local_signature, dtype=np.float32)
-                    - np.asarray(item.get("board_local_signature"), dtype=np.float32)
-                )))
-                for item in representatives
-                if item.get("board_local_signature") and len(item["board_local_signature"]) == len(local_signature)
-            ]
-            if local_distances:
-                admitted = admitted and min(local_distances) <= IDENTITY_LOCAL_MAX_DISTANCE
-                if not admitted:
-                    return False, score, "local_board_identity_contradiction"
-    else:
-        admitted = distances[0] <= IDENTITY_GROUP_MAX_DISTANCE
-    if not admitted:
-        return False, score, "board_identity_contradiction"
-    return True, score, "board_identity_compatible"
-
-
-def _identity_retry_score(
-    photo: dict,
-    group_index: int,
-    representatives: list[dict],
-    clusters: list[list[dict]],
-    cards: list[dict],
-) -> tuple[float, str]:
-    """Return an evidence score and an explainable retry strategy."""
-    shot_type = str(photo.get("shot_type") or "")
-    visual = _identity_representative_score(photo, representatives)
-    photo_time = _capture_seconds(photo)
-    group_time = _cluster_time_center(clusters[group_index])
-    temporal = 0.0
-    if photo_time is not None and group_time is not None:
-        temporal = min(abs(photo_time - group_time) / 480.0, 1.0)
-
-    if shot_type == "side_profile":
-        # Side profiles are deliberately weak identity evidence. Their retry
-        # route is the controlled capture protocol: choose among adjacent
-        # card lanes by time, then use visual evidence only to reject a clear
-        # contradiction.
-        # Do not let the narrow side crop overturn the capture protocol. The
-        # visual term is retained only for diagnostics; assignment is based on
-        # the neighboring group's mean time.
-        return temporal * 0.20, "side_profile_temporal_neighbor"
-    if shot_type == "fin_detail":
-        return visual * 0.90 + temporal * 0.10, "fin_detail_identity_retry"
-    if shot_type == "full_board":
-        return visual * 0.96 + temporal * 0.04, "full_board_visual_retry"
-    return visual * 0.90 + temporal * 0.10, "generic_identity_retry"
-
-
-def _retry_group_candidates(photo: dict, cards: list[dict], count: int) -> list[int]:
-    """Limit expensive retries to plausible card-neighbor groups."""
-    if not cards:
-        return list(range(count))
-    if photo.get("shot_type") != "side_profile":
-        return list(range(count))
-    return _side_profile_neighbor_lanes(photo, cards, count)
-
-
-def _global_identity_clusters(
-    photos: list[dict],
-    seed_lanes: list[list[dict]],
-    count: int,
-    cards: list[dict] | None = None,
-) -> list[list[dict]]:
-    """Assign photos using trusted seeds followed by targeted retries.
-
-    Timestamp lanes are candidate windows only. The old implementation copied
-    every lane into its initial representative, so one boundary mistake became
-    permanent evidence for the wrong board. This version locks a small,
-    coherent set of high-confidence views first, then retries the remainder
-    against those frozen/robust representatives.
-    """
-    ordered_cards = sorted(cards or [], key=lambda item: item.get("_sequence_index", 0))
-    candidate_lanes = [list(seed_lanes[index]) if index < len(seed_lanes) else [] for index in range(count)]
-    clusters: list[list[dict]] = [[] for _ in range(count)]
-    # These seeds are the identity anchor for the entire pass.  They must not
-    # be rebuilt from later assignments, otherwise one bad boundary photo can
-    # gradually redefine the group and then validate itself.
-    frozen_representatives: list[list[dict]] = [[] for _ in range(count)]
-    locked: set[int] = set()
-    last_unassigned: list[dict] = []
-    if not photos:
-        return clusters
-    bridge_seeds = _card_bridge_seeds(ordered_cards, candidate_lanes) if ordered_cards else [None] * count
-    # Phase 1: accumulate only trusted guesses. The soft lanes narrow the
-    # search, but ownership is earned by centrality and mutual similarity.
-    for group_index, lane in enumerate(candidate_lanes):
-        bridge = bridge_seeds[group_index] if group_index < len(bridge_seeds) else None
-        if bridge is not None:
-            clusters[group_index].append(bridge)
-            frozen_representatives[group_index] = [bridge]
-            locked.add(id(bridge))
-        remaining_lane = [item for item in lane if id(item) not in locked]
-        trusted = _trusted_identity_members(remaining_lane)
-        accepted_trusted = []
-        for photo in trusted:
-            if id(photo) in locked:
-                continue
-            if bridge is not None and (
-                tuple(photo.get("board_identity_signature") or ())
-                == tuple(bridge.get("board_identity_signature") or ())
-            ):
-                # An identical signature is not independent evidence. Keep
-                # the frame unresolved so a duplicate-looking boundary shot
-                # cannot silently inflate the anchored group.
-                continue
-            conflicts = (
-                _photo_identity_conflicts(photo, ordered_cards[group_index], ordered_cards)
-                if group_index < len(ordered_cards) else []
-            )
-            if conflicts:
-                photo["identity_assignment_conflicts"] = conflicts
-                continue
-            if bridge is not None:
-                admitted, _, reason = _identity_admission(photo, [bridge], [bridge])
-                if not admitted:
-                    photo["identity_assignment_reason"] = reason
-                    continue
-            clusters[group_index].append(photo)
-            accepted_trusted.append(photo)
-            locked.add(id(photo))
-            photo["identity_assignment_reason"] = "trusted_seed"
-        if not frozen_representatives[group_index]:
-            frozen_representatives[group_index] = accepted_trusted
-
-    # Phase 2: expensive retries. Prototypes are rebuilt only from accepted
-    # members, never from unresolved or quarantined photos.
-    for retry_round in range(IDENTITY_RETRY_ROUNDS):
-        representatives = [_identity_representatives(cluster) for cluster in clusters]
-        unresolved = [photo for photo in photos if id(photo) not in locked]
-        if not unresolved:
-            break
-        assignments: list[tuple[float, int, dict, str]] = []
-        still_unassigned: list[dict] = []
-        for photo in unresolved:
-            candidate_indices = _retry_group_candidates(photo, ordered_cards, count)
-            scored = []
-            conflicts_by_cluster = {}
-            # Prefer the neighboring chronological lanes first, but retain
-            # bounded global backtracking for a card photographed slightly
-            # late or early. Ordering is a prior, never an assignment.
-            photo_time = _capture_seconds(photo)
-            def temporal_candidate_key(index: int) -> tuple[float, int]:
-                group_time = _cluster_time_center(clusters[index])
-                if photo_time is None or group_time is None:
-                    return float("inf"), index
-                return abs(group_time - photo_time), index
-
-            candidate_indices = sorted(candidate_indices, key=temporal_candidate_key)
-            for group_index in candidate_indices:
-                conflicts = (
-                    _photo_identity_conflicts(photo, ordered_cards[group_index], ordered_cards)
-                    if group_index < len(ordered_cards) else []
-                )
-                conflicts_by_cluster[group_index] = conflicts
-                if conflicts:
-                    continue
-                score, reason = _identity_retry_score(
-                    photo, group_index, representatives[group_index], clusters, ordered_cards,
-                )
-                admitted, admission_score, admission_reason = _identity_admission(
-                    photo,
-                    clusters[group_index],
-                    frozen_representatives[group_index] or representatives[group_index],
-                )
-                if not admitted:
-                    conflicts_by_cluster[group_index] = [admission_reason]
-                    continue
-                score = max(score, admission_score)
-                scored.append((score, group_index, reason))
-            if not scored:
-                photo["identity_assignment_reason"] = "explicit_identity_conflict"
-                photo["identity_assignment_conflicts"] = conflicts_by_cluster
-                still_unassigned.append(photo)
-                continue
-            scored.sort(key=lambda row: (row[0], row[1]))
-            best_score, winner, reason = scored[0]
-            second_score = scored[1][0] if len(scored) > 1 else None
-            margin = (second_score - best_score) if second_score is not None else None
-            # Side profiles have a protocol-driven route and are accepted on
-            # the local time decision. Other shots need both a plausible
-            # distance and a meaningful lead over the next group.
-            side_profile = photo.get("shot_type") == "side_profile"
-            acceptable = (
-                side_profile
-                or (
-                    best_score <= IDENTITY_ASSIGNMENT_MAX_DISTANCE
-                    and (margin is None or margin >= IDENTITY_ASSIGNMENT_MIN_MARGIN)
-                )
-            )
-            if not acceptable:
-                photo["identity_assignment_reason"] = "ambiguous_identity" if margin is not None and margin < IDENTITY_ASSIGNMENT_MIN_MARGIN else "weak_identity_match"
-                photo["identity_assignment_scores"] = [
-                    {"group_index": index, "distance": round(float(score), 6)}
-                    for score, index, _ in scored
-                ]
-                still_unassigned.append(photo)
-                continue
-            # A retry round should not bulk-absorb every remaining photo. Lock
-            # only the strongest half of each group, then rebuild prototypes;
-            # later rounds handle the harder angles with better evidence.
-            assignments.append((best_score, winner, photo, reason))
-
-        by_group: dict[int, list[tuple[float, dict, str]]] = {}
-        for score, winner, photo, reason in assignments:
-            by_group.setdefault(winner, []).append((score, photo, reason))
-        for winner, rows in by_group.items():
-            rows.sort(key=lambda row: (row[0], _identity_candidate_key(row[1])))
-            # Round one is intentionally conservative; subsequent rounds may
-            # admit more, but each group still gets its strongest evidence.
-            quota = max(1, min(len(rows), 2 if retry_round == 0 else len(rows)))
-            for score, photo, reason in rows[:quota]:
-                clusters[winner].append(photo)
-                locked.add(id(photo))
-                photo["identity_assignment_reason"] = reason
-                photo["identity_retry_round"] = retry_round + 1
-                photo["identity_retry_score"] = round(float(score), 6)
-            for _, photo, _ in rows[quota:]:
-                still_unassigned.append(photo)
-        last_unassigned = still_unassigned
-
-    # Final contamination pass. A group is only legitimate if every member
-    # still agrees with the group's trusted board identity. Any late member
-    # that fails is removed and returned to quarantine instead of being shown
-    # as part of a mixed board group.
-    contaminated: list[dict] = []
-    for cluster_index, cluster in enumerate(clusters):
-        representatives = frozen_representatives[cluster_index] or _identity_representatives(cluster)
-        retained = []
-        for photo in cluster:
-            admitted, score, reason = _identity_admission(photo, cluster, representatives)
-            if admitted:
-                retained.append(photo)
-                continue
-            photo["identity_assignment_reason"] = reason
-            photo["identity_retry_score"] = round(float(score), 6)
-            photo["identity_assignment_conflicts"] = ["final_group_coherence"]
-            contaminated.append(photo)
-        clusters[cluster_index] = retained
-
-    quarantined = [photo for photo in photos if id(photo) not in locked]
-    quarantined.extend(photo for photo in contaminated if id(photo) not in {id(item) for item in quarantined})
-    for photo in quarantined:
-        photo.setdefault("identity_assignment_reason", "weak_identity_match")
-    if quarantined:
-        assigned = {id(photo) for cluster in clusters for photo in cluster}
-        quarantined = [photo for photo in quarantined if id(photo) not in assigned]
-        for photo in quarantined:
-            photo.setdefault("identity_assignment_reason", "weak_identity_match")
-    return clusters + _split_quarantine_photos(quarantined)
-
-
-def _quarantine_cluster_coherence(cluster: list[dict]) -> float:
-    """Return the worst pairwise identity distance in a remainder cluster."""
-    if len(cluster) < 2:
-        return 0.0
-    return max(
-        visual_distance(left, right)
-        for index, left in enumerate(cluster)
-        for right in cluster[index + 1:]
-    )
-
-
-def _split_quarantine_photos(photos: list[dict]) -> list[list[dict]]:
-    """Split unassigned photos before exposing them as review groups."""
-    if not photos:
-        return []
-    remaining = list(photos)
-    clusters: list[list[dict]] = []
-    while remaining:
-        seed = remaining.pop(0)
-        cluster = [seed]
-        while remaining:
-            ranked = sorted(
-                (
-                    _median([visual_distance(candidate, member) for member in cluster]),
-                    index,
-                )
-                for index, candidate in enumerate(remaining)
-            )
-            if not ranked or ranked[0][0] > QUARANTINE_CLUSTER_MAX_DISTANCE:
-                break
-            _, candidate_index = ranked[0]
-            candidate = remaining[candidate_index]
-            proposed = cluster + [candidate]
-            if _quarantine_cluster_coherence(proposed) > QUARANTINE_CLUSTER_MAX_DISTANCE:
-                break
-            cluster.append(candidate)
-            remaining.pop(candidate_index)
-        clusters.append(cluster)
-
-    result: list[list[dict]] = []
-    for cluster in clusters:
-        if len(cluster) < QUARANTINE_CLUSTER_MIN_SIZE or _quarantine_cluster_coherence(cluster) > QUARANTINE_CLUSTER_MAX_DISTANCE:
-            for photo in cluster:
-                photo["_unassigned_photo"] = True
-                photo.setdefault("identity_assignment_reason", "no_coherent_quarantine_cluster")
-                result.append([photo])
-            continue
-        for photo in cluster:
-            photo["_unassigned_cluster"] = True
-        result.append(cluster)
-    return result
-
-
-def _group_from_global_identity(files: list[dict], cards: list[dict], photos: list[dict]) -> list[list[dict]]:
-    seed_lanes = _seed_card_lanes(cards, photos)
-    clusters = _global_identity_clusters(photos, seed_lanes, len(cards), cards)
-    # The final cluster is a cardless quarantine bucket. It must not be
-    # passed through card matching or the review photo becomes falsely owned
-    # by whichever card happens to be left over.
-    owned_clusters = clusters[:len(cards)]
-    review_clusters = clusters[len(cards):]
-    # Card labels are identity anchors, not free labels. Keep the one-to-one
-    # visual match, but require the cluster to remain within the capture-time
-    # neighborhood of its card. Disabling this guard swapped the Stewart card
-    # onto the neighboring Fire Wire cluster in real batches.
-    return _attach_cards_to_anchored_clusters(cards, owned_clusters) + review_clusters
-
-
-def _attach_cards_to_anchored_clusters(cards: list[dict], clusters: list[list[dict]]) -> list[list[dict]]:
-    """Attach cards to their pre-created slots, never to a best-fit cluster.
-
-    ``_global_identity_clusters`` creates one slot per sorted card. Re-running
-    card-to-cluster matching here would undo that ownership and can attach a
-    card to a neighboring board merely because both are visually generic.
-    """
-    ordered_cards = sorted(cards, key=lambda item: item.get("_sequence_index", 0))
-    groups = []
-    for index, cluster in enumerate(clusters[:len(ordered_cards)]):
-        card = ordered_cards[index]
-        already_present = any(item is card for item in cluster)
-        groups.append(([] if already_present else [card]) + list(cluster))
-    for card in ordered_cards[len(groups):]:
-        groups.append([card])
+        if current is None:
+            if not groups:
+                groups.append([])
+            current = groups[0]
+        current.append(item)
     return groups
 
 
-def _group_from_card_lanes(files: list[dict], cards: list[dict], photos: list[dict]) -> list[list[dict]]:
-    """Make card-anchored chronological lanes, then refine their boundaries.
+def assign_shot_types_by_position(groups: list[list[dict]]) -> None:
+    """Assign shot_type by position in each card-anchored, ordered group.
 
-    The initial lane is the nearest-card time partition. Each boundary may
-    move only within the local eight-photo neighborhood and only when a sharp
-    visual change supports the move. This keeps cards from competing across an
-    entire batch while still handling a card photographed slightly late.
+    The capture protocol is fixed: up to ``SHOT_LIMITS["full_board"]`` full
+    board views, then one side profile, then optionally one fin detail, in
+    that order. Position already tells us the type — guessing it from pixel
+    shape (a silhouette's width, an aspect ratio) is where real
+    misclassifications came from: a standing side-rail shot whose detected
+    box happened to measure wide was called full_board and ended up
+    contaminating an unrelated board's group. Mutates items in place. A
+    photo beyond the known protocol slots (real, if rare: an extra shot) is
+    left as full_board rather than guessed at or dropped.
     """
-    ordered_cards = sorted(cards, key=lambda item: item.get("_sequence_index", 0))
-    ordered_photos = sorted(photos, key=lambda item: item.get("_sequence_index", 0))
-    card_keys = [_card_order_key(card) for card in ordered_cards]
-    photo_keys = [_card_order_key(photo) for photo in ordered_photos]
-    initial_boundaries = []
-    for left, right in zip(card_keys, card_keys[1:]):
-        initial_boundaries.append((left + right) / 2.0)
-    boundaries = []
-    for initial in initial_boundaries:
-        midpoint_boundary = sum(1 for key in photo_keys if key <= initial)
-        boundaries.append(_refine_lane_boundary(ordered_photos, midpoint_boundary))
-    boundaries = sorted(max(0, min(len(ordered_photos), boundary)) for boundary in boundaries)
-    lanes = []
-    start = 0
-    for boundary in boundaries:
-        boundary = max(start, boundary)
-        lanes.append(ordered_photos[start:boundary])
-        start = boundary
-    lanes.append(ordered_photos[start:])
-    grouped: list[list[dict]] = []
-    for index, lane in enumerate(lanes):
-        subclusters = _cluster_board_photos(lane)
-        if not subclusters:
-            grouped.append([ordered_cards[index]])
-            continue
-        # The card can only match a visual run inside its own chronological
-        # lane. It can never pull a photo across another card's lane.
-        grouped.extend(_match_cards_to_clusters([ordered_cards[index]], subclusters))
-    return grouped
-
-
-def _card_order_key(item: dict) -> float:
-    capture = _capture_seconds(item)
-    if capture is not None:
-        return capture
-    return float(item.get("_sequence_index", 0))
-
-
-def _boundary_change_score(photos: list[dict], boundary: int) -> float:
-    if boundary < 2 or len(photos) - boundary < 2:
-        return 0.0
-    left = photos[max(0, boundary - 3):boundary]
-    right = photos[boundary:min(len(photos), boundary + 3)]
-    if len(left) < 2 or len(right) < 2:
-        return 0.0
-    across = _context_distance(left, right)
-    within = max(_context_cohesion(left), _context_cohesion(right))
-    return across - within
-
-
-def _refine_lane_boundary(photos: list[dict], initial: int) -> int:
-    """Find the strongest supported change point near a card-time boundary."""
-    candidates = list(range(
-        max(2, initial - BOUNDARY_REFINEMENT_RADIUS),
-        min(len(photos) - 1, initial + BOUNDARY_REFINEMENT_RADIUS) + 1,
-    ))
-    # The capture protocol ends each board with a side profile immediately
-    # before the next inventory card. If that profile is in the local search
-    # window, every boundary at or before it is invalid. Merely removing the
-    # exact boundary before the profile is insufficient: the visual scorer can
-    # otherwise choose one frame earlier and produce the same one-photo shift.
-    profiles_in_window = [
-        index for index in range(max(0, initial - BOUNDARY_REFINEMENT_RADIUS), min(len(photos), initial + BOUNDARY_REFINEMENT_RADIUS + 1))
-        if photos[index].get("shot_type") == "side_profile"
-    ]
-    if profiles_in_window:
-        candidates = [boundary for boundary in candidates if boundary > max(profiles_in_window)]
-    minimum_boundary = max(profiles_in_window, default=-1) + 1
-    scored = sorted(
-        (
-            (_boundary_change_score(photos, boundary), boundary)
-            for boundary in candidates
-        ),
-        reverse=True,
+    slots = (
+        ["full_board"] * SHOT_LIMITS.get("full_board", 4)
+        + ["side_profile"] * SHOT_LIMITS.get("side_profile", 1)
+        + ["fin_detail"] * SHOT_LIMITS.get("fin_detail", 1)
     )
-    if not scored or scored[0][0] < BOARD_SIMILARITY_BOUNDARY / 3:
-        # Preserve the protocol invariant even when visual evidence is weak:
-        # the final side profile belongs to the preceding card lane.
-        return minimum_boundary if profiles_in_window else initial
-    return scored[0][1]
-
-
-def _cluster_board_photos(photos: list[dict]) -> list[list[dict]]:
-    """Create visual board clusters without letting cards contaminate them."""
-    if not photos:
-        return []
-    clusters = _split_by_board_similarity([photos])
-    return clusters
-
-
-def _cluster_distance(left: list[dict], right: list[dict]) -> float:
-    return _median([
-        visual_distance(before, after)
-        for before in left[-LOCAL_NEIGHBOR_COUNT:]
-        for after in right[:LOCAL_NEIGHBOR_COUNT]
-    ])
-
-
-def _cluster_time_center(cluster: list[dict]) -> float | None:
-    captures = [value for value in (_capture_seconds(item) for item in cluster) if value is not None]
-    return sum(captures) / len(captures) if captures else None
-
-
-def _card_cluster_score(card: dict, cluster: list[dict], *, global_match: bool = False) -> float:
-    visual = card_visual_affinity(card, cluster)
-    if visual is None:
-        visual = 1.0
-    card_time, cluster_time = _capture_seconds(card), _cluster_time_center(cluster)
-    if global_match and card_time is not None:
-        photo_times = [value for value in (_capture_seconds(item) for item in cluster) if value is not None]
-        temporal = min((abs(card_time - value) for value in photo_times), default=0.0) / 60.0
-        return visual * 0.25 + min(temporal, CARD_MATCH_MAX_MINUTES) * 0.05
-    if card_time is None or cluster_time is None:
-        temporal = 0.5
-    else:
-        temporal = abs(card_time - cluster_time) / 60.0
-    sequence = 0.0
-    if card_time is None:
-        card_position = card.get("_sequence_index")
-        positions = [item.get("_sequence_index") for item in cluster if item.get("_sequence_index") is not None]
-        if card_position is not None and positions:
-            start, end = min(positions), max(positions)
-            sequence = min(abs(card_position - start), abs(card_position - end)) * 0.1
-            # A card between two runs conventionally starts the following
-            # board's photo set. Prefer that run over the completed run just
-            # before it when visual evidence is otherwise tied.
-            if end < card_position:
-                sequence += 0.5
-    # Time is a useful anchor for the controlled photo protocol; visual
-    # evidence breaks ties but cannot rescue a distant card match.
-    return temporal + visual * 0.25 + sequence
-
-
-def _match_cards_to_clusters(cards: list[dict], clusters: list[list[dict]], *, enforce_time: bool = True) -> list[list[dict]]:
-    """Attach cards only to a nearby compatible cluster, one-to-one."""
-    if not clusters:
-        return [[card] for card in cards]
-    assignments: dict[int, int] = {}
-    pairs = sorted(
-        (_card_cluster_score(card, cluster, global_match=not enforce_time), card_index, cluster_index)
-        for card_index, card in enumerate(cards)
-        for cluster_index, cluster in enumerate(clusters)
-    )
-    used_cards: set[int] = set()
-    used_clusters: set[int] = set()
-    max_minutes = CARD_MATCH_MAX_MINUTES
-    for score, card_index, cluster_index in pairs:
-        if card_index in used_cards or cluster_index in used_clusters:
-            continue
-        card_time = _capture_seconds(cards[card_index])
-        cluster_time = _cluster_time_center(clusters[cluster_index])
-        visual = card_visual_affinity(cards[card_index], clusters[cluster_index])
-        if not enforce_time:
-            assignments[cluster_index] = card_index
-            used_cards.add(card_index)
-            used_clusters.add(cluster_index)
-            continue
-        if card_time is None or cluster_time is None:
-            if visual is not None and visual > CARD_MATCH_MAX_VISUAL_DISTANCE:
-                continue
-        if card_time is not None and cluster_time is not None:
-            if abs(card_time - cluster_time) > max_minutes * 60:
-                continue
-        assignments[cluster_index] = card_index
-        used_cards.add(card_index)
-        used_clusters.add(cluster_index)
-    groups = []
-    for cluster_index, cluster in enumerate(clusters):
-        card_index = assignments.get(cluster_index)
-        card = cards[card_index] if card_index is not None else None
-        # A board photo can also contain its inventory card. It is already in
-        # the visual cluster, so do not duplicate it as a synthetic leading
-        # card item in the output group.
-        already_present = card is not None and any(item is card for item in cluster)
-        groups.append(([] if card is None or already_present else [card]) + list(cluster))
-    groups.extend([cards[index:index + 1] for index in range(len(cards)) if index not in used_cards])
-    return groups
-
-
-def _split_oversized_groups(groups: list[list[dict]], include_card: bool = True) -> list[list[dict]]:
-    """Apply only the physical seven-photo cap; shot types remain review data."""
-    limited: list[list[dict]] = []
-    limit = MAX_PHOTOS_PER_BOARD if include_card else STANDARD_BOARD_PHOTOS
     for group in groups:
-        remaining = list(group)
-        while len(remaining) > limit:
-            limited.append(remaining[:limit])
-            remaining = remaining[limit:]
-        if remaining:
-            limited.append(remaining)
-    return limited
+        position = 0
+        for item in group:
+            if is_card_anchor(item):
+                item["shot_type"] = "card"
+                continue
+            item["shot_type"] = slots[position] if position < len(slots) else "full_board"
+            item["shot_type_source"] = "capture_position"
+            position += 1
 
 
-def _split_by_board_similarity(groups: list[list[dict]]) -> list[list[dict]]:
-    """Split mixed sessions by board appearance, then attach cards to a cluster.
+def next_shot_type_for_occupancy(counts: dict[str, int]) -> str:
+    """Return the next protocol slot type given a board's current counts.
 
-    Cards provide identity data, but the board photos determine membership.
-    Card frames are excluded from the boundary calculation because their
-    paper/background layout is intentionally different from board frames.
+    Same slot order as assign_shot_types_by_position (full_board, then
+    side_profile, then fin_detail), but keyed by what a board already has
+    rather than raw capture position - for a photo manually moved onto an
+    existing board after the fact, whose own original position belonged to
+    a different group's sequence and says nothing about this board's
+    actual gap. Cards never pass through here.
     """
-    partitioned: list[list[dict]] = []
-    for group in groups:
-        photos = [item for item in group if not item.get("is_card")]
-        cards = [item for item in group if item.get("is_card")]
-        if len(cards) > 1 or len(photos) < 4:
-            partitioned.append(group)
-            continue
-        candidates: list[tuple[float, int]] = []
-        for index in range(1, len(photos)):
-            left_context = _local_context(photos, index, -1)
-            right_context = _local_context(photos, index, 1)
-            # Three immediately adjacent frames are enough to establish a
-            # change point. Requiring four on each side caused a board at a
-            # card boundary to borrow photos from its neighbor.
-            left_context = left_context[:3]
-            right_context = right_context[:3]
-            if index < 2 or len(photos) - index < 2 or len(left_context) < 2 or len(right_context) < 2:
-                continue
-            across = _context_distance(left_context, right_context)
-            within = max(_context_cohesion(left_context), _context_cohesion(right_context))
-            if across >= BOARD_SIMILARITY_BOUNDARY and across >= within + BOARD_SIMILARITY_BOUNDARY / 3:
-                candidates.append((across - within, index))
-        boundaries: list[int] = []
-        for _, index in sorted(candidates, reverse=True):
-            if all(abs(index - selected) >= 2 for selected in boundaries):
-                boundaries.append(index)
-        boundaries.sort()
-        if not boundaries:
-            partitioned.append(group)
-            continue
-        clusters: list[list[dict]] = []
-        start = 0
-        for boundary in boundaries:
-            clusters.append(photos[start:boundary])
-            start = boundary
-        clusters.append(photos[start:])
-        # Cards are deliberately not inserted here. Keeping them out of the
-        # visual-run pass prevents a card's yellow paper/background from
-        # changing the board boundary calculation; matching happens once all
-        # runs are known.
-        partitioned.extend(cluster for cluster in clusters if cluster)
-    return partitioned
+    for shot_type in ("full_board", "side_profile", "fin_detail"):
+        if counts.get(shot_type, 0) < SHOT_LIMITS.get(shot_type, 0):
+            return shot_type
+    return "full_board"
 
 
 def shot_bucket(item: dict) -> str | None:
@@ -1936,3 +1378,86 @@ def _enforce_shot_limits(groups: list[list[dict]]) -> list[list[dict]]:
         if current:
             limited.append(current)
     return limited
+
+
+def embedding_distance(left: "np.ndarray | None", right: "np.ndarray | None") -> float | None:
+    """Cosine distance between two pooled SAM 2 embeddings, or None if
+    either is unavailable."""
+    if left is None or right is None:
+        return None
+    return float(1.0 - np.dot(left, right))
+
+
+def locate_missed_card_boundary(distances: list[float]) -> int | None:
+    """Given consecutive-pair embedding distances within an oversized,
+    card-anchored group (in capture order), return the index to split
+    after if one gap clearly stands out as a likely missed card, else
+    None.
+
+    This is a tie-breaker, not a decision-maker. Capture order already
+    assigned every photo in this group to one board; this only ever runs
+    on a group that's already structurally oversized (more photos than
+    the fixed protocol allows for one board), and it only acts when the
+    evidence for a second board inside it is strong: one gap both
+    absolutely large and clearly the odd one out among the group's own
+    other adjacent gaps. A merely large group with no such standout gap
+    is left alone for a human to resolve, rather than force-split on a
+    weak signal.
+
+    The thresholds below are a starting point, not a value tuned against
+    labeled examples — there was no accessible "this group really does
+    contain 2 boards, split exactly here" ground truth to calibrate
+    against yet. Revisit once real oversized groups with a known correct
+    split point are available to check this against.
+    """
+    if len(distances) < 2:
+        return None
+    ranked = sorted(distances, reverse=True)
+    top, runner_up = ranked[0], ranked[1]
+    if top < 0.3 or top < runner_up * 1.5:
+        return None
+    return distances.index(top) + 1
+
+
+def split_oversized_groups_by_embedding(groups: list[list[dict]]) -> list[list[dict]]:
+    """Split an oversized group at a likely missed-card boundary, using
+    SAM 2's own image embedding as a tie-breaker (see
+    ``locate_missed_card_boundary``).
+
+    Lazy and optional: with no SAM 2 checkpoint configured this is a
+    no-op and every group passes through unchanged. Only groups already
+    larger than the standard protocol size are even considered — a
+    correctly sized group never touches SAM 2 or an embedding here.
+    """
+    segmenter = get_segmenter()
+    if segmenter is None:
+        return groups
+    result: list[list[dict]] = []
+    for group in groups:
+        photos = [item for item in group if not is_card_anchor(item)]
+        if len(photos) <= STANDARD_BOARD_PHOTOS:
+            result.append(group)
+            continue
+        embeddings = []
+        for item in photos:
+            try:
+                image, _ = read_image(item["path"])
+            except Exception:
+                embeddings.append(None)
+                continue
+            embeddings.append(segmenter.embed(image))
+        distances = [
+            embedding_distance(left, right) or 0.0
+            for left, right in zip(embeddings, embeddings[1:])
+        ]
+        split_at = locate_missed_card_boundary(distances)
+        if split_at is None:
+            result.append(group)
+            continue
+        card = next((item for item in group if is_card_anchor(item)), None)
+        second_half = photos[split_at:]
+        for item in second_half:
+            item["identity_assignment_reason"] = "sam2_embedding_boundary_split"
+        result.append(([card] if card else []) + photos[:split_at])
+        result.append(second_half)
+    return result

@@ -3,7 +3,7 @@
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Advanced debug · UsedSurf</title><link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}"><link rel="stylesheet" href="{{ url_for('static', filename='ui.css') }}"></head>
 <body><main class="shell debug-shell">
   {% include "_site_nav.html" %}
-  <header class="page-header"><div><p class="eyebrow">TECHNICAL TOOLS</p><h1>Advanced debug</h1><p class="lede">Local-only diagnostics and recovery tools. These controls are for troubleshooting a stalled or incomplete batch.</p></div><a class="secondary action-button" href="{{ url_for('runs') }}">Open run control center</a></header>
+  <header class="page-header"><div><h1>Advanced debug</h1><p class="lede">Local-only diagnostics and recovery tools. These controls are for troubleshooting a stalled or incomplete batch.</p></div><a class="secondary action-button" href="{{ url_for('runs') }}">Open run control center</a></header>
   <section class="debug-grid" aria-label="System health">
     <article class="debug-card"><span>Database schema</span><strong>v{{ schema_version }}</strong><small>{{ db_path }}</small></article>
     <article class="debug-card"><span>Active photos</span><strong>{{ active_photos }}</strong><small>currently in input/</small></article>

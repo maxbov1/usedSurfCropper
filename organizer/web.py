@@ -19,10 +19,12 @@ from PIL import Image
 
 from .config import model_path, paths
 from .crop import _silhouette_mask
+from .card_ocr import ocr_quality
 from .board_evidence import board_evidence_diagnostics, detect_side_profile_fins, extract_board_evidence, extract_photo_evidence
 from .db import connect, create_run, record_artifact, recover_stale_runs, set_run_worker, update_run
 from .export import export_board, safe_name
-from .ingest import MAX_PHOTOS_PER_BOARD, PROCESSING_VERSION, SHOT_LIMITS, STANDARD_BOARD_PHOTOS, _enforce_shot_limits, board_group_diagnostics, board_identity_diagnostics, board_identity_signature, board_local_signature, board_ocr, group_limit_violations, group_scanned, is_card_anchor, local_ocr, ocr_runtime_status, read_image, scan_files, set_board_identity_weights
+from .ingest import MAX_PHOTOS_PER_BOARD, PROCESSING_VERSION, SHOT_LIMITS, STANDARD_BOARD_PHOTOS, _enforce_shot_limits, assign_shot_types_by_position, board_group_diagnostics, board_identity_diagnostics, board_identity_signature, board_local_signature, board_ocr, group_limit_violations, group_scanned, is_card_anchor, local_ocr, next_shot_type_for_occupancy, ocr_runtime_status, read_image, scan_files, set_board_identity_weights, split_oversized_groups_by_embedding
+from .segmentation import board_perimeter
 from .grouping_learning import load_weights, record_human_save, write_feature_snapshot
 from .retention import compact_archive, persist_manifest, prepare_archive
 
@@ -53,6 +55,8 @@ def create_app(root: Path) -> Flask:
     directories = paths(root)
     db_path = directories["data"] / "usedsurf.sqlite3"
     upload_log_path = directories["data"] / "logs" / "upload.log"
+    grouping_progress_path = directories["data"] / "grouping-progress.json"
+    grouping_log_path = directories["data"] / "logs" / "grouping.log"
 
     def write_upload_log(message: str) -> None:
         try:
@@ -62,8 +66,59 @@ def create_app(root: Path) -> Flask:
         except OSError:
             pass
 
+    def write_grouping_progress(run_id: str, phase: str, message: str, done: int = 0, total: int = 0, status: str = "running", error: str = "") -> None:
+        """Publish progress outside the request so the browser can poll it."""
+        stages = {
+            "scanning": (1, "Reading photos"),
+            "grouping": (2, "Finding groups"),
+            "classifying": (3, "Analyzing boards"),
+            "matching": (4, "Comparing identities"),
+            "enriching": (5, "Checking details"),
+            "saving": (6, "Saving groups"),
+            "complete": (6, "Complete"),
+        }
+        stage, stage_label = stages.get(phase, (0, "Preparing"))
+        phase_percent = round(100 * min(1.0, max(0.0, done / total))) if total > 0 else None
+        payload = {
+            "run_id": run_id,
+            "status": status,
+            "phase": phase,
+            "stage": stage,
+            "stage_count": 6,
+            "stage_label": stage_label,
+            "message": message,
+            "done": done,
+            "total": total,
+            "phase_percent": phase_percent,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "error": error,
+        }
+        try:
+            grouping_progress_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = grouping_progress_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(payload, indent=2) + "\n")
+            os.replace(temporary, grouping_progress_path)
+            with grouping_log_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        except OSError:
+            pass
+
     def db():
         return connect(db_path)
+
+    @app.errorhandler(500)
+    def grouping_server_error(error):
+        """Make synchronous grouping failures visible to the polling UI."""
+        try:
+            progress = json.loads(grouping_progress_path.read_text())
+            run_id = str(progress.get("run_id", ""))
+            if run_id:
+                write_grouping_progress(run_id, progress.get("phase", "error"), "Grouping failed.", progress.get("done", 0), progress.get("total", 0), status="failed", error=str(error))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+        if request.accept_mimetypes.best == "application/json":
+            return jsonify({"ok": False, "error": "Grouping failed. Open the grouping log for details."}), 500
+        return error
 
     def worker_command(kind: str, run_id: str) -> list[str]:
         if getattr(sys, "frozen", False):
@@ -82,41 +137,32 @@ def create_app(root: Path) -> Flask:
             digest.update(f"{path.name}\0{stat.st_size}\0{stat.st_mtime_ns}".encode())
         return digest.hexdigest()
 
-    def load_processing_cache() -> dict[str, dict]:
-        cache_path = directories["data"] / "photo-processing-cache.json"
+    def current_grouping_state(conn, signature: str, active_count: int) -> tuple[bool, bool]:
+        """Return (already grouped, OCR newly available) for the active batch."""
+        if not active_count:
+            return False, False
+        previous = conn.execute("SELECT value FROM app_meta WHERE key='active_input_signature'").fetchone()
+        if not previous or previous["value"] != signature:
+            return False, False
+        previous_grouping = conn.execute(
+            "SELECT pipeline_version FROM grouping_feedback_batches WHERE input_signature=? ORDER BY created_at DESC LIMIT 1",
+            (signature,),
+        ).fetchone()
+        if not previous_grouping or previous_grouping["pipeline_version"] != PROCESSING_VERSION:
+            return False, False
         try:
-            payload = json.loads(cache_path.read_text())
-            if payload.get("processing_version") != PROCESSING_VERSION:
-                return {}
-            return payload.get("photos", {})
+            saved_ocr_runtime = json.loads((directories["data"] / "ocr-status.json").read_text()).get("runtime", {})
         except (OSError, json.JSONDecodeError, AttributeError):
-            return {}
-
-    def save_processing_cache(items: list[dict]) -> None:
-        cache_path = directories["data"] / "photo-processing-cache.json"
-        photos = {}
-        for item in items:
-            content_hash = item.get("hash")
-            if not content_hash or "error" in item:
-                continue
-            cached = {
-                key: value for key, value in item.items()
-                if key not in {"path", "hash", "_processing_cache_hit"} and not key.startswith("_")
-            }
-            cached["cache_version"] = PROCESSING_VERSION
-            cached["complete"] = True
-            try:
-                json.dumps(cached)
-            except (TypeError, ValueError):
-                continue
-            photos[content_hash] = cached
-        try:
-            cache_path.write_text(json.dumps({"processing_version": PROCESSING_VERSION, "photos": photos}, indent=2) + "\n")
-        except OSError:
-            pass
+            saved_ocr_runtime = {}
+        ocr_recovered = not saved_ocr_runtime.get("available", False) and ocr_runtime_status().get("available", False)
+        return not ocr_recovered, ocr_recovered
 
     def crop_run_paths(true_mode: bool, run_id: str | None = None) -> tuple[Path, Path, str | None]:
         if not true_mode:
+            if not run_id:
+                latest = directories["data"] / "crop-eval" / "latest-run.txt"
+                if latest.is_file():
+                    run_id = latest.read_text().strip() or None
             if run_id:
                 run_root = directories["data"] / "crop-eval" / "runs" / run_id
                 return run_root / "report.json", run_root / "annotations.json", run_id
@@ -130,6 +176,27 @@ def create_app(root: Path) -> Flask:
             run_root = root / "runs" / selected
             return run_root / "report.json", run_root / "annotations.json", selected
         return root / "baseline-v1.json", root / "annotations.json", "legacy"
+
+    def manual_crop_required(item: dict) -> bool:
+        """Recognize failed proposals in both current and older crop reports."""
+        if item.get("manual_required") is True:
+            return True
+        reason = str(item.get("method", "")).lower()
+        if "manual crop required" in reason:
+            return True
+        return item.get("model_available") is False and not reason
+
+    def reviewed_crop(item: dict, annotation: dict) -> bool:
+        decision = annotation.get("decision")
+        if decision not in {"good", "manual"}:
+            return False
+        if not manual_crop_required(item):
+            return True
+        if decision != "manual":
+            return False
+        source_size = item.get("source_size") or item
+        crop = annotation.get("expected_crop") or {}
+        return bool(annotation.get("rotation") or crop != {"x": 0, "y": 0, "width": source_size.get("width"), "height": source_size.get("height")})
 
     def active_retest_path() -> Path | None:
         """Choose the current grouping report without letting an experiment win.
@@ -159,40 +226,34 @@ def create_app(root: Path) -> Flask:
 
     @app.get("/upload-photos")
     def upload_photos():
-        with db() as conn:
-            all_boards = conn.execute("SELECT * FROM boards ORDER BY id").fetchall()
-            active_board_ids = {row["board_id"] for row in conn.execute("SELECT DISTINCT board_id, source_path FROM photos") if (root / row["source_path"]).is_file()}
-            boards = [board for board in all_boards if board["id"] in active_board_ids]
-            counts = {row["board_id"]: row["n"] for row in conn.execute("SELECT board_id, COUNT(*) n FROM photos GROUP BY board_id") if row["board_id"] in active_board_ids}
-            thumbnails = {}
-            for row in conn.execute("SELECT board_id, source_path FROM photos ORDER BY COALESCE(capture_time, '9999'), source_path"):
-                if row["board_id"] not in active_board_ids:
-                    continue
-                thumbnails.setdefault(row["board_id"], []).append(row["source_path"])
-            needs = conn.execute("SELECT COUNT(*) n FROM photos WHERE review_status != 'approved'").fetchone()["n"]
         uploaded_files = [
-            str(path.relative_to(root))
-            for path in sorted(directories["input"].iterdir(), key=lambda item: item.name.lower())
+            path for path in sorted(directories["input"].iterdir(), key=lambda item: item.name.lower())
             if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg"}
         ]
-        crop_ready = False
-        crop_root = directories["data"] / "crop-eval" / "true-test-set"
-        latest_run = crop_root / "latest-run.txt"
-        if latest_run.exists():
-            run_id = latest_run.read_text().strip()
-            run_root = crop_root / "runs" / run_id
-            try:
-                report = json.loads((run_root / "report.json").read_text())
-                annotations = json.loads((run_root / "annotations.json").read_text()) if (run_root / "annotations.json").exists() else {}
-                listing_sources = [case["source"] for case in report.get("cases", []) if not case.get("exclude_from_listing")]
-                crop_ready = bool(report.get("complete")) and bool(listing_sources) and all(annotations.get(source, {}).get("decision") in {"good", "manual"} for source in listing_sources)
-            except (OSError, json.JSONDecodeError, TypeError):
-                crop_ready = False
-        return render_template("index.html", boards=boards, counts=counts, thumbnails=thumbnails, needs=needs, uploaded_files=uploaded_files, input_dir=directories["input"], cv2_available=_cv2_available(), crop_ready=crop_ready)
+        current_input_signature = input_signature() if uploaded_files else ""
+        with db() as conn:
+            stored_signature_row = conn.execute("SELECT value FROM app_meta WHERE key='active_input_signature'").fetchone()
+            library_ready = bool(uploaded_files and stored_signature_row and stored_signature_row["value"] == current_input_signature)
+            already_grouped, _ = current_grouping_state(conn, current_input_signature, len(uploaded_files))
+            if library_ready:
+                all_boards = conn.execute("SELECT * FROM boards ORDER BY id").fetchall()
+                active_board_ids = {row["board_id"] for row in conn.execute("SELECT DISTINCT board_id, source_path FROM photos") if (root / row["source_path"]).is_file()}
+                boards = [board for board in all_boards if board["id"] in active_board_ids]
+                counts = {row["board_id"]: row["n"] for row in conn.execute("SELECT board_id, COUNT(*) n FROM photos GROUP BY board_id") if row["board_id"] in active_board_ids}
+                thumbnails = {}
+                for row in conn.execute("SELECT board_id, source_path FROM photos ORDER BY COALESCE(capture_time, '9999'), source_path"):
+                    if row["board_id"] not in active_board_ids:
+                        continue
+                    thumbnails.setdefault(row["board_id"], []).append(row["source_path"])
+                needs = conn.execute("SELECT COUNT(*) n FROM photos WHERE review_status != 'approved'").fetchone()["n"]
+            else:
+                boards, counts, thumbnails, needs = [], {}, {}, 0
+        uploaded_files = [str(path.relative_to(root)) for path in uploaded_files]
+        return render_template("index.html", boards=boards, counts=counts, thumbnails=thumbnails, needs=needs, uploaded_files=uploaded_files, library_ready=library_ready, already_grouped=already_grouped, input_dir=directories["input"], cv2_available=_cv2_available())
 
     @app.get("/rules")
     def rules():
-        return render_template("info.html", title="Rules", eyebrow="RULES", sections=[
+        return render_template("info.html", title="Rules", sections=[
             ("Your originals", "Upload JPEG photos. The software keeps the original files unchanged."),
             ("What it assumes", "A normal board set usually includes one inventory card and about five or six board photos. The card may appear out of timestamp order or may be missed, so check the groups."),
             ("What it detects", "The software reads the inventory card for SKU, brand, model, and fin information when possible. It uses computer vision to suggest board crops, but the suggestions are not guaranteed."),
@@ -201,11 +262,11 @@ def create_app(root: Path) -> Flask:
 
     @app.get("/how-to")
     def how_to():
-        return render_template("info.html", title="How To", eyebrow="HOW TO", sections=[
+        return render_template("info.html", title="How To", sections=[
             ("1 · Upload", "Drop your JPEG photos into the upload area, then choose Continue."),
             ("2 · Check groups", "Make sure each board's photos are together. Drag a photo to another row if it is in the wrong group."),
             ("3 · Review photos", "Go through every listing photo. If the suggested crop looks good, move to the next photo. That automatically accepts the suggestion. If it is wrong, draw the crop yourself."),
-            ("4 · Prepare upload", "When every photo has been reviewed, choose Open board upload grid. From there, drag individual images to BigCommerce or select a board and download its folder."),
+            ("4 · Prepare upload", "When every photo has been reviewed, choose Go to export. From there, drag individual images to BigCommerce or select a board and download its folder."),
         ])
 
     @app.get("/runs")
@@ -298,6 +359,25 @@ def create_app(root: Path) -> Flask:
         if not upload_log_path.is_file():
             return app.response_class("No upload events have been logged yet.\n", mimetype="text/plain")
         return app.response_class(upload_log_path.read_text(errors="replace")[-30000:], mimetype="text/plain")
+
+    @app.get("/debug/grouping-log")
+    def grouping_log():
+        if not grouping_log_path.is_file():
+            return app.response_class("No grouping events have been logged yet.\n", mimetype="text/plain")
+        return app.response_class(grouping_log_path.read_text(errors="replace")[-50000:], mimetype="text/plain")
+
+    @app.get("/process-status/<run_id>")
+    def process_status(run_id):
+        """Return live grouping progress while the synchronous process request runs."""
+        if run_id != Path(run_id).name:
+            return jsonify({"status": "failed", "error": "Invalid grouping run id."}), 400
+        try:
+            progress = json.loads(grouping_progress_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            progress = {"run_id": run_id, "status": "starting", "phase": "starting", "stage": 0, "stage_count": 6, "stage_label": "Preparing", "message": "Starting grouping…", "phase_percent": None, "done": 0, "total": 0}
+        if progress.get("run_id") != run_id:
+            progress = {"run_id": run_id, "status": "starting", "phase": "starting", "stage": 0, "stage_count": 6, "stage_label": "Preparing", "message": "Starting grouping…", "phase_percent": None, "done": 0, "total": 0}
+        return jsonify(progress)
 
     @app.get("/debug/board-identity")
     def board_identity_log():
@@ -436,56 +516,96 @@ def create_app(root: Path) -> Flask:
     def process():
         signature = input_signature()
         with db() as conn:
-            previous = conn.execute("SELECT value FROM app_meta WHERE key='active_input_signature'").fetchone()
-            active_count = conn.execute("SELECT COUNT(*) n FROM photos WHERE source_path LIKE 'input/%'").fetchone()["n"]
-            previous_grouping = conn.execute(
-                "SELECT pipeline_version FROM grouping_feedback_batches WHERE input_signature=? ORDER BY created_at DESC LIMIT 1",
-                (signature,),
-            ).fetchone()
-        grouping_is_current = previous_grouping and previous_grouping["pipeline_version"] == PROCESSING_VERSION
-        if previous and previous["value"] == signature and active_count and grouping_is_current:
-            ocr_status_path = directories["data"] / "ocr-status.json"
-            saved_ocr_runtime = {}
-            try:
-                saved_ocr_runtime = json.loads(ocr_status_path.read_text()).get("runtime", {})
-            except (OSError, json.JSONDecodeError, AttributeError):
-                pass
-            ocr_recovered = not saved_ocr_runtime.get("available", False) and ocr_runtime_status().get("available", False)
-            if not ocr_recovered:
-                flash("This batch is already grouped. Review the current folders before starting another pass.", "success")
-                return redirect(url_for("shuffleboard"))
+            active_count = sum(
+                1 for path in directories["input"].iterdir()
+                if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg"}
+            )
+            already_grouped, ocr_recovered = current_grouping_state(conn, signature, active_count)
+        if already_grouped:
+            if request.accept_mimetypes.best == "application/json":
+                return jsonify({"ok": True, "already_grouped": True, "redirect": url_for("shuffleboard")})
+            return redirect(url_for("shuffleboard"))
+        if ocr_recovered:
             flash("OCR is now available; rescanning this batch for board identity fields.", "success")
-        group_run_id = datetime.now().strftime("group-%Y%m%d-%H%M%S-%f")
+        requested_run_id = str(request.headers.get("X-Grouping-Progress-Id", "")).strip()
+        group_run_id = requested_run_id if requested_run_id and requested_run_id.replace("-", "").isalnum() else datetime.now().strftime("group-%Y%m%d-%H%M%S-%f")
+        write_grouping_progress(group_run_id, "starting", f"Preparing {active_count} photos…", total=active_count)
         with db() as conn:
             create_run(conn, group_run_id, "grouping", pipeline_version=PROCESSING_VERSION,
                        input_signature=signature, metadata={"input_count": active_count}, status="running")
-        scanned = scan_files(directories["input"], load_processing_cache())
-        # Shot composition is part of grouping constraints, not only crop
-        # presentation. Reuse the same classifier before partitioning so a
-        # second fin/detail cannot silently enter an otherwise valid group.
-        from .crop import classify_shot
-        for item in scanned:
-            if item.get("_processing_cache_hit"):
-                continue
+        write_grouping_progress(group_run_id, "scanning", f"Reading {active_count} photos…", total=active_count)
+        def scan_progress(done, total, filename, cached=False):
+            write_grouping_progress(
+                group_run_id,
+                "scanning",
+                f"Read photo {done} of {total}: {filename}",
+                done,
+                total,
+            )
+
+        scanned = scan_files(directories["input"], progress=scan_progress)
+        write_grouping_progress(group_run_id, "grouping", "Finding board groups from capture order and image evidence…")
+        # Grouping runs first and decides shot_type by position in each
+        # card-anchored, capture-ordered group (see group_scanned /
+        # assign_shot_types_by_position) — not by guessing a photo's shape.
+        # The per-photo pass below only needs to know the type that
+        # decision already produced; it never recomputes or overrides it.
+        groups = group_scanned(scanned)
+        # Tie-breaker only: a group this oversized already means capture
+        # order couldn't fully explain it (most likely a missed card). SAM 2
+        # embeddings get one chance to find a confident internal boundary
+        # before shot types are assigned; a group it can't confidently split
+        # (or with no SAM 2 configured at all) passes through unchanged for
+        # _enforce_shot_limits' plain arithmetic split further down.
+        groups = split_oversized_groups_by_embedding(groups)
+        assign_shot_types_by_position(groups)
+        from .crop import classify_shot, usable_yolo_prompt_box
+        total_scanned = len(scanned)
+        write_grouping_progress(group_run_id, "classifying", f"Analyzing {total_scanned} photos…", total=total_scanned)
+        for item_index, item in enumerate(scanned, start=1):
             if "error" in item or item.get("is_card"):
-                item["shot_type"] = "card" if item.get("is_card") else ""
+                write_grouping_progress(group_run_id, "classifying", f"Checked photo {item_index} of {total_scanned}", item_index, total_scanned)
                 continue
             try:
                 image, _ = read_image(item["path"])
+                # classify_shot() is used here only for its candidate box
+                # (a useful region hint for OCR cropping below) — never for
+                # its own shot_type guess, which is where real
+                # misclassifications used to come from.
                 classification = classify_shot(image)
-                item["shot_type"] = str(classification.get("shot_type", "")) if classification.get("confidence", 0) else ""
                 item["board_candidate"] = classification.get("candidate")
+                # classify_shot() runs GrabCut plus 1-3 YOLO passes - real
+                # cost, and the crop worker (a separate later process) would
+                # otherwise redo all of it from scratch for every photo.
+                # Persist the raw result now so cropping can skip straight
+                # to using it.
+                item["classification_snapshot"] = dict(classification)
+                # SAM 2 is optional and lazy (see board_perimeter): with no
+                # checkpoint configured this is None and the signatures below
+                # fall back to the candidate rectangle alone, unchanged. The
+                # box/score are persisted so the crop worker (a separate
+                # process, run later) reuses this instead of predicting again.
+                yolo_prompt = usable_yolo_prompt_box(classification.get("yolo_detection"), image.width, image.height, item["shot_type"])
+                perimeter = board_perimeter(image, item["shot_type"], prompt_box=yolo_prompt)
+                region_mask = perimeter["mask"] if perimeter else None
+                item["board_perimeter"] = (
+                    {"box": list(perimeter["box"]), "score": perimeter["score"]}
+                    if perimeter and perimeter.get("box") and perimeter.get("score") is not None
+                    else None
+                )
                 item["board_identity_signature"] = board_identity_signature(
                     image,
                     classification.get("candidate"),
                     item["shot_type"],
                     item.get("card_regions") or [],
+                    region_mask,
                 )
                 item["board_local_signature"] = board_local_signature(
                     image,
                     classification.get("candidate"),
                     item["shot_type"],
                     item.get("card_regions") or [],
+                    region_mask,
                 )
                 if item["shot_type"] == "side_profile":
                     # These views are poor OCR sources. Card OCR, when a
@@ -495,52 +615,49 @@ def create_app(root: Path) -> Flask:
                     photo_ocr_error = ""
                     item["photo_ocr_status"] = "skipped_angle"
                 elif item["shot_type"] == "fin_detail":
-                    # Fin-detail frames are not useful for broad board OCR,
-                    # but they are the best source for tail/box evidence.
-                    item["board_evidence"] = extract_board_evidence(
-                        image,
-                        classification.get("candidate"),
-                        item["shot_type"],
-                        ocr_runner=local_ocr,
-                    )
-                    photo_text = item["board_evidence"].get("ocr_text", "")
-                    photo_ocr_error = "; ".join(item["board_evidence"].get("errors", [])[:2])
-                    item["photo_ocr_status"] = "error" if photo_ocr_error else ("nonempty" if photo_text.strip() else "empty")
+                    # Fin-detail OCR is deferred until grouping proves that
+                    # this group actually needs fin/box evidence.
+                    photo_text, photo_ocr_error = "", ""
+                    item["photo_ocr_status"] = "deferred_angle"
                 elif item["shot_type"] == "full_board":
-                    photo_text, _, photo_ocr_error = board_ocr(image, classification.get("candidate"))
-                    # Board OCR is supplemented by board-relative, enlarged
-                    # crops. Keep the per-region output so diagnostics can
-                    # distinguish missing capture from failed comparison.
-                    item["board_evidence"] = extract_board_evidence(
-                        image,
-                        classification.get("candidate"),
-                        item["shot_type"],
-                        ocr_runner=local_ocr,
-                    )
-                    regional_text = item["board_evidence"].get("ocr_text", "")
-                    if regional_text:
-                        photo_text = "\n".join(value for value in (photo_text, regional_text) if value)
-                    if not photo_ocr_error and item["board_evidence"].get("errors"):
-                        photo_ocr_error = "; ".join(item["board_evidence"]["errors"][:2])
-                    item["photo_ocr_status"] = "error" if photo_ocr_error else ("nonempty" if photo_text.strip() else "empty")
+                    # Board signatures are sufficient for the first grouping
+                    # pass. Expensive multi-crop OCR is selected after groups
+                    # exist, only where it can resolve a real uncertainty.
+                    photo_text, photo_ocr_error = "", ""
+                    item["photo_ocr_status"] = "deferred_identity"
                 else:
-                    photo_text, _, photo_ocr_error = local_ocr(image)
-                    item["photo_ocr_status"] = "error" if photo_ocr_error else ("nonempty" if photo_text.strip() else "empty")
+                    photo_text, photo_ocr_error = "", ""
+                    item["photo_ocr_status"] = "deferred_unclassified"
                 item["photo_ocr_text"] = photo_text
                 item["photo_ocr_error"] = photo_ocr_error
-                item["identity_evidence"] = extract_photo_evidence(photo_text, item["shot_type"])
+                photo_quality = ocr_quality(photo_text)
+                item["photo_ocr_quality"] = photo_quality
+                if item.get("photo_ocr_status") not in {
+                    "skipped_angle", "deferred_angle", "deferred_identity", "deferred_unclassified",
+                } and not photo_ocr_error:
+                    item["photo_ocr_status"] = "usable" if photo_quality.get("status") == "usable" else (
+                        "empty" if photo_quality.get("status") == "empty" else "junk"
+                    )
+                item["identity_evidence"] = (
+                    extract_photo_evidence(photo_text, item["shot_type"])
+                    if photo_quality.get("status") == "usable" else {}
+                )
                 if item["shot_type"] == "side_profile":
                     visual_fins = detect_side_profile_fins(image, classification.get("candidate"))
                     if visual_fins.get("value"):
                         item["identity_evidence"]["fins_included"] = visual_fins
             except Exception as exc:
-                item["shot_type"] = ""
+                # shot_type is left as grouping already decided it (by
+                # position) — this failure is about OCR/signature
+                # enrichment, not about which board or slot the photo is.
                 item["photo_ocr_text"] = ""
                 item["processing_error"] = f"{type(exc).__name__}: {exc}"
                 item["photo_ocr_error"] = item["processing_error"]
                 item["photo_ocr_status"] = "error"
+                item["photo_ocr_quality"] = {"status": "error"}
                 item["identity_evidence"] = {}
-        save_processing_cache(scanned)
+            write_grouping_progress(group_run_id, "classifying", f"Processed photo {item_index} of {total_scanned}", item_index, total_scanned)
+        write_grouping_progress(group_run_id, "matching", "Comparing board identity evidence…")
         with db() as conn:
             excluded = {row["source_path"] for row in conn.execute("SELECT source_path FROM excluded_sources")}
             current_sources = {str(item["path"].relative_to(root)) for item in scanned if "error" not in item}
@@ -588,7 +705,80 @@ def create_app(root: Path) -> Flask:
             # proposal reviewable by splitting an over-limit cluster before
             # it reaches SQLite or the shuffleboard. A human may still
             # deliberately override this arrangement in the shuffleboard.
-            groups = _enforce_shot_limits(group_scanned(scanned))
+            # ``groups`` was already computed above (capture-order grouping,
+            # then shot_type assigned by position) — only the overflow-
+            # splitting safety net runs here.
+            groups = _enforce_shot_limits(groups)
+            # Expensive board/fin OCR is demand-driven. The first pass uses
+            # card OCR plus board signatures; only incomplete or conflicted
+            # groups receive representative enrichment.
+            deferred_targets = []
+            for group in groups:
+                card = next((item for item in group if is_card_anchor(item)), None)
+                identifier = (card or {}).get("identifier") or {}
+                needs_identity = (
+                    card is None
+                    or not identifier.get("brand")
+                    or not identifier.get("model")
+                    or any(item.get("identity_assignment_conflicts") for item in group)
+                    or len(group) < STANDARD_BOARD_PHOTOS
+                )
+                needs_fin = (
+                    card is None
+                    or not identifier.get("fin_system")
+                    or not identifier.get("fin_box_count")
+                    or not any(item.get("shot_type") == "fin_detail" for item in group)
+                )
+                selected = []
+                if needs_identity:
+                    # Two representative full-board views are enough to
+                    # resolve a missing/conflicting identity. The remaining
+                    # views stay cheap unless a later review explicitly
+                    # requests deeper evidence.
+                    selected.extend(
+                        item for item in group if item.get("shot_type") == "full_board"
+                    )
+                    selected = selected[:2]
+                if needs_fin:
+                    selected.extend(
+                        item for item in group if item.get("shot_type") == "fin_detail"
+                    )
+                seen = set()
+                for item in selected:
+                    if id(item) not in seen:
+                        deferred_targets.append(item)
+                        seen.add(id(item))
+            if deferred_targets:
+                write_grouping_progress(group_run_id, "enriching", f"Checking {len(deferred_targets)} targeted board views…", 0, len(deferred_targets))
+            for target_index, item in enumerate(deferred_targets, start=1):
+                try:
+                    image, _ = read_image(item["path"])
+                    if item.get("shot_type") == "fin_detail":
+                        item["board_evidence"] = extract_board_evidence(
+                            image, item.get("board_candidate"), item["shot_type"],
+                            ocr_runner=lambda patch: local_ocr(patch, fast=True),
+                            use_text_patches=True,
+                        )
+                        photo_text = item["board_evidence"].get("ocr_text", "")
+                    else:
+                        photo_text, _, photo_ocr_error = board_ocr(image, item.get("board_candidate"), fast=True)
+                        item["board_evidence"] = extract_board_evidence(
+                            image, item.get("board_candidate"), item["shot_type"],
+                            ocr_runner=lambda patch: local_ocr(patch, fast=True),
+                            use_text_patches=True,
+                        )
+                        regional_text = item["board_evidence"].get("ocr_text", "")
+                        if regional_text:
+                            photo_text = "\n".join(value for value in (photo_text, regional_text) if value)
+                    item["photo_ocr_text"] = photo_text
+                    item["photo_ocr_quality"] = ocr_quality(photo_text)
+                    item["photo_ocr_status"] = "usable" if item["photo_ocr_quality"].get("status") == "usable" else ("junk" if photo_text.strip() else "empty")
+                    item["identity_evidence"] = extract_photo_evidence(photo_text, item.get("shot_type", "")) if item["photo_ocr_quality"].get("status") == "usable" else {}
+                except Exception as exc:
+                    item["photo_ocr_status"] = "error"
+                    item["photo_ocr_error"] = f"{type(exc).__name__}: {exc}"
+                write_grouping_progress(group_run_id, "enriching", f"Checked targeted view {target_index} of {len(deferred_targets)}", target_index, len(deferred_targets))
+            write_grouping_progress(group_run_id, "saving", f"Preparing {len(groups)} proposed groups…", total=len(groups))
             learning_snapshot = write_feature_snapshot(directories["data"], group_run_id, scanned)
             evidence_report = {
                 "pipeline_version": PROCESSING_VERSION,
@@ -623,8 +813,10 @@ def create_app(root: Path) -> Flask:
                 "proposed_groups": len(groups),
                 "identifiers_extracted": sum(1 for item in scanned if item.get("identifier")),
                 "ocr_attempts": sum(1 for item in scanned if item.get("ocr_status") in {"read", "empty", "error"}) + sum(1 for item in scanned if not item.get("is_card") and item.get("photo_ocr_status") in {"empty", "nonempty", "error"}),
-                "photo_ocr_attempts": sum(1 for item in scanned if not item.get("is_card") and item.get("photo_ocr_status") in {"empty", "nonempty", "error"}),
-                "photo_ocr_nonempty": sum(1 for item in scanned if not item.get("is_card") and item.get("photo_ocr_status") == "nonempty"),
+                "photo_ocr_attempts": sum(1 for item in scanned if not item.get("is_card") and item.get("photo_ocr_status") in {"empty", "usable", "junk", "error"}),
+                "photo_ocr_usable": sum(1 for item in scanned if not item.get("is_card") and item.get("photo_ocr_status") == "usable"),
+                "photo_ocr_junk": sum(1 for item in scanned if not item.get("is_card") and item.get("photo_ocr_status") == "junk"),
+                "photo_ocr_nonempty": sum(1 for item in scanned if not item.get("is_card") and item.get("photo_ocr_status") in {"usable", "junk"}),
                 "photo_ocr_empty": sum(1 for item in scanned if not item.get("is_card") and item.get("photo_ocr_status") == "empty"),
                 "photo_ocr_usable_fields": sum(1 for item in scanned if not item.get("is_card") and item.get("identity_evidence")),
                 "photo_ocr_errors": sum(1 for item in scanned if not item.get("is_card") and item.get("photo_ocr_status") == "error"),
@@ -643,6 +835,7 @@ def create_app(root: Path) -> Flask:
             initial_grouping = {}
             for group_number, group in enumerate(groups, start=1):
                 if not group:
+                    write_grouping_progress(group_run_id, "saving", f"Prepared group {group_number} of {len(groups)}", group_number, len(groups))
                     continue
                 card = next((item for item in group if is_card_anchor(item)), None)
                 ident = (card or {}).get("identifier", {})
@@ -687,18 +880,22 @@ def create_app(root: Path) -> Flask:
                         # prior blank card predictions without touching human
                         # grouping/crop corrections.
                         persisted_ocr = item.get("ocr") or item.get("photo_ocr_text", "")
-                        conn.execute("UPDATE photos SET source_is_card=?, shot_type=CASE WHEN ? <> '' THEN ? ELSE shot_type END, ocr_text=CASE WHEN ? <> '' THEN ? ELSE ocr_text END, card_fins_included=CASE WHEN ? <> '' THEN ? ELSE card_fins_included END, card_fin_system=CASE WHEN ? <> '' THEN ? ELSE card_fin_system END WHERE id=?", (int(item["is_card"]), item.get("shot_type", ""), item.get("shot_type", ""), persisted_ocr, persisted_ocr, item.get("identifier", {}).get("fins_included", ""), item.get("identifier", {}).get("fins_included", ""), item.get("identifier", {}).get("fin_system", ""), item.get("identifier", {}).get("fin_system", ""), old["id"]))
+                        perimeter_json = json.dumps(item["board_perimeter"]) if item.get("board_perimeter") else ""
+                        classification_json = json.dumps(item["classification_snapshot"]) if item.get("classification_snapshot") else ""
+                        conn.execute("UPDATE photos SET source_is_card=?, shot_type=CASE WHEN ? <> '' THEN ? ELSE shot_type END, ocr_text=CASE WHEN ? <> '' THEN ? ELSE ocr_text END, card_fins_included=CASE WHEN ? <> '' THEN ? ELSE card_fins_included END, card_fin_system=CASE WHEN ? <> '' THEN ? ELSE card_fin_system END, board_perimeter=CASE WHEN ? <> '' THEN ? ELSE board_perimeter END, classification_snapshot=CASE WHEN ? <> '' THEN ? ELSE classification_snapshot END WHERE id=?", (int(item["is_card"]), item.get("shot_type", ""), item.get("shot_type", ""), persisted_ocr, persisted_ocr, item.get("identifier", {}).get("fins_included", ""), item.get("identifier", {}).get("fins_included", ""), item.get("identifier", {}).get("fin_system", ""), item.get("identifier", {}).get("fin_system", ""), perimeter_json, perimeter_json, classification_json, classification_json, old["id"]))
                         continue
                     # Grouping is deliberately separate from cropping. Keep a
                     # full-frame placeholder until this group is approved.
                     shot = item.get("shot_type") or ("card" if item["is_card"] else "unclassified")
                     persisted_ocr = item.get("ocr") or item.get("photo_ocr_text", "")
-                    conn.execute("INSERT INTO photos(board_id, source_path, content_hash, capture_time, width, height, shot_type, original_prediction, crop_x, crop_y, crop_w, crop_h, source_is_card, ocr_text, card_fins_included, card_fin_system) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (board_id, source_path, item["hash"], item["capture"], item["width"], item["height"], shot, "grouping only; crop not run", 0, 0, item["width"], item["height"], int(item["is_card"]), persisted_ocr, item.get("identifier", {}).get("fins_included", ""), item.get("identifier", {}).get("fin_system", "")))
+                    conn.execute("INSERT INTO photos(board_id, source_path, content_hash, capture_time, width, height, shot_type, original_prediction, crop_x, crop_y, crop_w, crop_h, source_is_card, ocr_text, card_fins_included, card_fin_system, board_perimeter, classification_snapshot) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (board_id, source_path, item["hash"], item["capture"], item["width"], item["height"], shot, "grouping only; crop not run", 0, 0, item["width"], item["height"], int(item["is_card"]), persisted_ocr, item.get("identifier", {}).get("fins_included", ""), item.get("identifier", {}).get("fin_system", ""), json.dumps(item["board_perimeter"]) if item.get("board_perimeter") else "", json.dumps(item["classification_snapshot"]) if item.get("classification_snapshot") else ""))
+                write_grouping_progress(group_run_id, "saving", f"Prepared group {group_number} of {len(groups)}", group_number, len(groups))
             conn.execute("INSERT OR REPLACE INTO grouping_feedback_batches(run_id, input_signature, pipeline_version, created_at, status) VALUES (?,?,?,?,?)", (group_run_id, signature, PROCESSING_VERSION, datetime.now().isoformat(timespec="seconds"), "proposed"))
             for source_path, initial in initial_grouping.items():
                 photo = conn.execute("SELECT id, content_hash FROM photos WHERE source_path=?", (source_path,)).fetchone()
                 if photo:
                     conn.execute("INSERT OR REPLACE INTO grouping_feedback(run_id, photo_id, source_path, content_hash, initial_board_id, initial_board_label) VALUES (?,?,?,?,?,?)", (group_run_id, photo["id"], source_path, photo["content_hash"], initial["board_id"], initial["board_label"]))
+            write_grouping_progress(group_run_id, "saving", "Committing proposed groups…")
         conn.commit()
         with db() as conn:
             conn.execute("INSERT INTO app_meta(key,value) VALUES('active_input_signature',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (signature,))
@@ -706,6 +903,7 @@ def create_app(root: Path) -> Flask:
             update_run(conn, group_run_id, "complete", metadata={"scanned": len(scanned), "groups": len(groups), "cards": sum(1 for item in scanned if item.get("is_card")), "ocr": ocr_summary, "learning": {"active": bool(learned_weights), "snapshot": bool(learning_snapshot), "weights_version": (learned_weights or {}).get("version")}})
             conn.commit()
             card_count = sum(1 for item in scanned if is_card_anchor(item))
+        write_grouping_progress(group_run_id, "complete", f"Grouped {len(scanned)} photos into {len(groups)} groups.", total=total_scanned, done=total_scanned, status="complete")
         warning = " OCR/card detection found no card boundaries; review the group before editing." if card_count == 0 and scanned else ""
         if card_count and len(groups) != card_count:
             short_groups = sum(1 for group in groups if len(group) < STANDARD_BOARD_PHOTOS)
@@ -715,6 +913,8 @@ def create_app(root: Path) -> Flask:
         elif ocr_summary["cards_detected"] and not ocr_summary["identifiers_extracted"]:
             warning += " Cards were detected but OCR extracted no identifiers; open Advanced debug and inspect OCR status."
         flash(f"Grouped {len(scanned)} originals into {len(groups)} proposed folder(s), six standard or seven with fins. Cropping has not run.{warning}", "success")
+        if request.accept_mimetypes.best == "application/json":
+            return jsonify({"ok": True, "run_id": group_run_id, "redirect": url_for("shuffleboard")})
         return redirect(url_for("shuffleboard"))
 
     @app.post("/upload")
@@ -886,7 +1086,16 @@ def create_app(root: Path) -> Flask:
                 boards = conn.execute("SELECT * FROM boards WHERE id IN (SELECT DISTINCT board_id FROM photos WHERE source_path LIKE 'input/%') ORDER BY id").fetchall()
                 now = datetime.now().isoformat(timespec="seconds")
                 for photo in photos:
-                    conn.execute("INSERT OR IGNORE INTO grouping_predictions(photo_id, predicted_board_id, predicted_label, predicted_at) VALUES (?,?,?,?)", (photo["id"], photo["board_id"], photo["board_label"], now))
+                    # Predictions belong to the current grouping pass. The
+                    # old INSERT OR IGNORE left prior-run board IDs in place,
+                    # so a fresh grouping appeared to contain human moves
+                    # even when the current model had just assigned the
+                    # photo there.
+                    conn.execute(
+                        "INSERT INTO grouping_predictions(photo_id, predicted_board_id, predicted_label, predicted_at) VALUES (?,?,?,?) "
+                        "ON CONFLICT(photo_id) DO UPDATE SET predicted_board_id=excluded.predicted_board_id, predicted_label=excluded.predicted_label, predicted_at=excluded.predicted_at",
+                        (photo["id"], photo["board_id"], photo["board_label"], now),
+                    )
                 predictions = {str(row["photo_id"]): dict(row) for row in conn.execute("SELECT * FROM grouping_predictions")}
                 photo_data = [dict(row) for row in photos]
                 retest_mode = False
@@ -1009,6 +1218,27 @@ def create_app(root: Path) -> Flask:
                     model_limit_warnings.append(warning)
             now = datetime.now().isoformat(timespec="seconds")
             moved = 0
+            # A photo moved onto a different board no longer matches the
+            # capture-position slot it was assigned when grouping ran -
+            # that position belonged to its old group's sequence, not this
+            # one. Re-derive its shot_type from the TARGET board's existing
+            # occupancy (by type, not raw order) so a moved-in photo fills
+            # whichever protocol slot that board is actually missing,
+            # instead of silently keeping a stale label from its old spot.
+            target_board_shot_counts: dict[int, dict[str, int]] = {}
+
+            def next_shot_type_slot(board_id: int) -> str:
+                counts = target_board_shot_counts.get(board_id)
+                if counts is None:
+                    counts = {"full_board": 0, "side_profile": 0, "fin_detail": 0}
+                    for row in conn.execute("SELECT shot_type FROM photos WHERE board_id=? AND source_is_card=0", (board_id,)):
+                        if row["shot_type"] in counts:
+                            counts[row["shot_type"]] += 1
+                    target_board_shot_counts[board_id] = counts
+                bucket = next_shot_type_for_occupancy(counts)
+                counts[bucket] = counts.get(bucket, 0) + 1
+                return bucket
+
             for photo_id, board_id in normalized_assignments.items():
                 try:
                     board_id_int = int(board_id)
@@ -1025,7 +1255,11 @@ def create_app(root: Path) -> Flask:
                     predicted_board_id = prediction["predicted_board_id"] if prediction else initial_board_id
                     conn.execute("INSERT INTO grouping_corrections(photo_id, predicted_board_id, corrected_board_id, corrected_at) VALUES (?,?,?,?) ON CONFLICT(photo_id) DO UPDATE SET corrected_board_id=excluded.corrected_board_id, corrected_at=excluded.corrected_at", (int(photo_id), predicted_board_id, target, now))
                 if photo["board_id"] != target:
-                    conn.execute("UPDATE photos SET board_id=?, human_correction=? WHERE id=?", (target, "grouping_manual" if target != initial_board_id else None, int(photo_id)))
+                    if photo["source_is_card"]:
+                        conn.execute("UPDATE photos SET board_id=?, human_correction=? WHERE id=?", (target, "grouping_manual" if target != initial_board_id else None, int(photo_id)))
+                    else:
+                        new_shot_type = next_shot_type_slot(target)
+                        conn.execute("UPDATE photos SET board_id=?, shot_type=?, human_correction=? WHERE id=?", (target, new_shot_type, "grouping_manual" if target != initial_board_id else None, int(photo_id)))
                     moved += 1
                 if initial and target != initial_board_id:
                     target_row = conn.execute("SELECT label FROM boards WHERE id=?", (target,)).fetchone()
@@ -1078,7 +1312,8 @@ def create_app(root: Path) -> Flask:
     @app.get("/crop-status/<run_id>")
     def crop_status(run_id):
         crop_root = directories["data"] / "crop-eval"
-        if not (crop_root / "runs" / run_id).exists():
+        true_mode = not (crop_root / "runs" / run_id).exists()
+        if true_mode:
             crop_root = crop_root / "true-test-set"
         progress_path = crop_root / "runs" / run_id / "progress.json"
         if not progress_path.exists():
@@ -1116,7 +1351,8 @@ def create_app(root: Path) -> Flask:
                         "source": source,
                         "source_url": url_for("media", relative=source),
                         "board": item.get("board", Path(source).parent.name),
-                        "model_available": True,
+                        "model_available": not manual_crop_required(item),
+                        "manual_required": manual_crop_required(item),
                         "width": item["source_size"]["width"],
                         "height": item["source_size"]["height"],
                         "proposal": item.get("proposal", item.get("crop")),
@@ -1125,7 +1361,7 @@ def create_app(root: Path) -> Flask:
                         "shot_type": item.get("evaluated_shot_type", item.get("shot_type", "")),
                         "rotation": item.get("rotation", {"angle": 0.0, "applied": False}),
                         "annotation": annotations.get(source, {}),
-                        "dataset": f"true:{run_id}",
+                        "dataset": f"{'true' if true_mode else 'batch'}:{run_id}",
                     })
             except (OSError, KeyError, TypeError, json.JSONDecodeError):
                 pass
@@ -1155,7 +1391,7 @@ def create_app(root: Path) -> Flask:
             # Older annotations stored the rectangle but not a crop JPEG. Materialize
             # that crop on read so the Original/Cropped toggle reflects the saved edit.
             if saved.get("expected_crop") and not saved.get("annotated_crop"):
-                source_path = root / source if true_mode else root / "sample-pack" / "usedsurf-crop-sample-pack" / source
+                source_path = root / source if (true_mode or source.startswith("input/")) else root / "sample-pack" / "usedsurf-crop-sample-pack" / source
                 if source_path.is_file():
                     annotated_dir = directories["data"] / "crop-eval" / ("true-test-set/annotated-crops" if true_mode else f"annotated-crops/{safe_name(board)}")
                     annotated_dir.mkdir(parents=True, exist_ok=True)
@@ -1169,15 +1405,21 @@ def create_app(root: Path) -> Flask:
                 "source_url": url_for("media", relative=source if true_mode or source.startswith("input/") else f"sample-pack/usedsurf-crop-sample-pack/{source}"),
                 "crop_url": url_for("media", relative=crop_relative),
                 "board": board,
-                "model_available": item.get("model_available", not item.get("method", "").startswith("OpenCV rejected")),
+                "model_available": not manual_crop_required(item),
+                "manual_required": manual_crop_required(item),
                 "width": item.get("source_size", {"width": item.get("width")})["width"], "height": item.get("source_size", {"height": item.get("height")})["height"], "proposal": item.get("proposal", item.get("crop")),
                 "method": item.get("method", ""), "classification": item.get("classification", {}), "shot_type": item.get("evaluated_shot_type", item.get("shot_type", "")), "cases": item.get("cases", []), "rotation": item.get("rotation", {"angle": 0.0, "applied": False}), "annotation": saved, "dataset": f"true:{run_id}" if true_mode else f"batch:{run_id or 'latest'}",
+                # Debug reference for pasting into a bug report: the overlay
+                # is the "mutated" image (crop box drawn on it), distinct
+                # from source_url (the untouched original) - see
+                # run_batch_crop.py's overlay filename tagging.
+                "overlay_url": url_for("media", relative=item["overlay_path"]) if item.get("overlay_path") else None,
             })
         board_groups = {}
         for item in items:
             item["board"] = item.get("board", "unassigned")
             board_groups.setdefault(item["board"], []).append(item)
-        all_reviewed = bool(items) and all(item.get("annotation", {}).get("decision") in {"good", "manual"} for item in items)
+        all_reviewed = bool(items) and all(reviewed_crop(item, item["annotation"]) for item in items)
         return render_template("annotate.html", items=items, board_groups=board_groups, true_mode=true_mode, processing_run=(run_id if true_mode and run_id != "legacy" else None), all_reviewed=all_reviewed, error=None)
 
     @app.get("/bigcommerce")
@@ -1204,7 +1446,7 @@ def create_app(root: Path) -> Flask:
             source = item.get("source", item.get("file"))
             annotation = annotations.get(source, {})
             total += 1
-            if annotation.get("decision") not in {"good", "manual"}:
+            if not reviewed_crop(item, annotation):
                 continue
             reviewed += 1
             crop_relative = annotation.get("annotated_crop") or (item.get("proposal_path", "") if true_mode else item.get("crop_preview", ""))
@@ -1417,37 +1659,96 @@ def create_app(root: Path) -> Flask:
         payload = request.get_json(silent=True) or {}
         source = payload.get("source", "")
         dataset = payload.get("dataset", "")
-        true_mode = dataset.startswith("true:") or dataset == "true"
-        run_id = dataset.split(":", 1)[1] if dataset.startswith("true:") else None
+        # Older review tabs received "true:batch-*" from crop_status even
+        # though those photos came from a batch run. Keep their saves working.
+        true_mode = (dataset.startswith("true:") or dataset == "true") and not dataset.startswith("true:batch-")
+        if dataset.startswith("true:"):
+            run_id = dataset.split(":", 1)[1]
+        elif dataset.startswith("batch:"):
+            token = dataset.split(":", 1)[1]
+            if token and token != "latest":
+                run_id = token
+            else:
+                latest_pointer = directories["data"] / "crop-eval" / "latest-run.txt"
+                run_id = latest_pointer.read_text().strip() if latest_pointer.is_file() else None
+        else:
+            run_id = None
         report_path, annotations_path, _ = crop_run_paths(true_mode, run_id)
+        if not report_path.exists() and not true_mode:
+            # A review tab can outlive its crop run. Recover against the latest
+            # batch only when it contains the same source photo below.
+            report_path, annotations_path, _ = crop_run_paths(False)
         if not report_path.exists():
-            return jsonify({"error": "Run the fixture runner first."}), 400
+            return jsonify({"error": "No crop report is available. Start crop review from the grouping page."}), 409
         report = json.loads(report_path.read_text())
         allowed = {item["source"]: item for item in report["cases"]} if true_mode else {item["file"]: item for item in report["files"]}
+        if source not in allowed and not true_mode:
+            latest_report, latest_annotations, _ = crop_run_paths(False)
+            if latest_report != report_path and latest_report.is_file():
+                latest_data = json.loads(latest_report.read_text())
+                latest_allowed = {item["file"]: item for item in latest_data["files"]}
+                if source in latest_allowed:
+                    report_path, annotations_path, report, allowed = latest_report, latest_annotations, latest_data, latest_allowed
         if source not in allowed:
-            return jsonify({"error": "Unknown fixture source."}), 400
+            return jsonify({"error": "This photo is not in the current crop run. Reopen crop review and try again."}), 409
         item = allowed[source]
         crop = payload.get("expected_crop") or {}
         try:
             values = {key: int(crop[key]) for key in ("x", "y", "width", "height")}
         except (KeyError, TypeError, ValueError):
             return jsonify({"error": "Expected crop must include integer x, y, width, and height."}), 400
-        source_path = root / source if true_mode else root / "sample-pack" / "usedsurf-crop-sample-pack" / source
+        # "source" is already a real repo-relative path ("input/...") for
+        # both the true-crop-eval flow and real batch runs - only the
+        # legacy sample-pack fixture flow needs that extra prefix (same
+        # signal annotate() uses to build source_url).
+        source_path = root / source if (true_mode or source.startswith("input/")) else root / "sample-pack" / "usedsurf-crop-sample-pack" / source
         if not source_path.is_file():
             return jsonify({"error": "Crop source is missing."}), 400
-        image, _ = read_image(source_path)
         rotation = float(payload.get("rotation", 0.0) or 0.0)
-        working = image.rotate(rotation, expand=True, resample=Image.Resampling.BICUBIC) if true_mode and rotation else image
-        if values["x"] < 0 or values["y"] < 0 or values["width"] < 1 or values["height"] < 1 or values["x"] + values["width"] > working.width or values["y"] + values["height"] > working.height:
-            return jsonify({"error": "Expected crop must stay inside the source image."}), 400
-        annotations = json.loads(annotations_path.read_text()) if annotations_path.exists() else {}
-        board = Path(source).parent.name if true_mode else item.get("board", "unassigned")
-        annotated_dir = directories["data"] / "crop-eval" / ("true-test-set/annotated-crops" if true_mode else f"annotated-crops/{safe_name(board)}")
-        annotated_dir.mkdir(parents=True, exist_ok=True)
-        annotated_path = annotated_dir / f"{Path(source).stem}.jpg"
-        working.crop((values["x"], values["y"], values["x"] + values["width"], values["y"] + values["height"])).save(annotated_path, "JPEG", quality=95, subsampling=0)
         decision = payload.get("decision", "manual")
+        if manual_crop_required(item) and decision != "manual":
+            return jsonify({"error": "The automatic crop failed. Draw and save a manual crop for this photo."}), 409
+        source_size = item.get("source_size") or item
+        if manual_crop_required(item) and not rotation and source_size.get("width") and source_size.get("height") and values == {"x": 0, "y": 0, "width": int(source_size["width"]), "height": int(source_size["height"])}:
+            return jsonify({"error": "Draw a smaller crop so the full photo is not exported unchanged."}), 400
         model_crop = item["proposal"] if true_mode else item["crop"]
+        # "Good" with the model's own unchanged rectangle just re-derives a
+        # file the batch crop worker already produced - re-reading the
+        # multi-megapixel source, re-doing its EXIF transpose, and
+        # re-encoding at quality=95/subsampling=0 (the slowest JPEG mode)
+        # on every click is pure duplicate work for far and away the most
+        # common click in this review flow. Point at that existing file
+        # instead whenever nothing actually changed.
+        # Not gated on decision=="good": the canvas also auto-fires a
+        # "manual" save on any click/drag (see annotate.html's pointerup
+        # handler), including ones that just re-trace the model's own green
+        # box without actually changing it. Whether the request arrived via
+        # "Good" or "Save my crop", identical values mean nothing actually
+        # changed, so the same fast path applies either way.
+        existing_crop = root / (item.get("proposal_path") if true_mode else item.get("crop_preview", "")) if (true_mode and item.get("proposal_path")) or (not true_mode and item.get("crop_preview")) else None
+        reuse_existing = (
+            not rotation
+            and model_crop
+            and values == {key: int(model_crop[key]) for key in ("x", "y", "width", "height")}
+            and existing_crop is not None
+            and existing_crop.is_file()
+        )
+        if reuse_existing:
+            annotated_path = existing_crop
+        else:
+            image, _ = read_image(source_path)
+            # Batch and fixture proposals both use expanded rotated-image
+            # coordinates when rotation is applied. Save against that same
+            # canvas or a valid manual crop can be rejected or misplaced.
+            working = image.rotate(rotation, expand=True, resample=Image.Resampling.BICUBIC) if rotation else image
+            if values["x"] < 0 or values["y"] < 0 or values["width"] < 1 or values["height"] < 1 or values["x"] + values["width"] > working.width or values["y"] + values["height"] > working.height:
+                return jsonify({"error": "Expected crop must stay inside the source image."}), 400
+            board = Path(source).parent.name if true_mode else item.get("board", "unassigned")
+            annotated_dir = directories["data"] / "crop-eval" / ("true-test-set/annotated-crops" if true_mode else f"annotated-crops/{safe_name(board)}")
+            annotated_dir.mkdir(parents=True, exist_ok=True)
+            annotated_path = annotated_dir / f"{Path(source).stem}.jpg"
+            working.crop((values["x"], values["y"], values["x"] + values["width"], values["y"] + values["height"])).save(annotated_path, "JPEG", quality=95, subsampling=0)
+        annotations = json.loads(annotations_path.read_text()) if annotations_path.exists() else {}
         annotations[source] = {"source": source, "expected_crop": values, "model_crop": model_crop, "user_crop": None if decision == "good" else values, "decision": decision, "rotation": rotation, "shot_type": payload.get("shot_type") or item.get("evaluated_shot_type", ""), "failure_labels": payload.get("failure_labels", []), "notes": payload.get("notes", "").strip(), "updated_at": datetime.now().isoformat(timespec="seconds"), "proposed_crop": model_crop, "annotated_crop": str(annotated_path.relative_to(root))}
         fd, temp_name = tempfile.mkstemp(prefix="annotations-", suffix=".json", dir=annotations_path.parent)
         try:

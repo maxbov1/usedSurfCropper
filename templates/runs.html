@@ -11,7 +11,7 @@
 <main class="shell runs-shell">
   {% include "_site_nav.html" %}
   <header class="page-header runs-header">
-    <div><p class="eyebrow">LOCAL CONTROL CENTER</p><h1>Runs</h1><p class="lede">See what the pipeline did, recover abandoned work, and restart crop jobs without touching your originals.</p></div>
+    <div><h1>Runs</h1><p class="lede">See what the pipeline did, recover abandoned work, and restart crop jobs without touching your originals.</p></div>
     <form method="post" action="{{ url_for('recover_runs') }}"><button class="secondary" type="submit">Recover abandoned runs</button></form>
   </header>
   {% with messages = get_flashed_messages(with_categories=true) %}

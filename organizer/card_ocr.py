@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import Iterable
+from difflib import SequenceMatcher
 
 
 FIELD_LABELS = {
@@ -21,6 +22,43 @@ FIELD_LABELS = {
 }
 _FIELD_STOP = r"(?:BRAND|MODEL|LENGTH|WIDTH|THICKNESS|VOLUME|FIN\s*SYSTEM|PRICE|BOARD\s*TYPE|ITEM|BOARD)"
 _NOISE = re.compile(r"\b(?:CHECKED[- ]?IN|PERSONAL INFORMATION|BOARD INFORMATION|USEDSURF|CONSIGNMENT|PAYMENT|SIGNATURE)\b", re.I)
+
+# Small, explicit vocabulary from the boards we actually process. This is a
+# correction layer, not a classifier: an OCR value is changed only when it is
+# close to a known alias. Unknown brands/models remain untouched.
+BRAND_ALIASES = {
+    "JS": ("js", "js industries", "jsindustries"),
+    "Sharpeye": ("sharpeye", "sharp eye", "sharpe yee", "sharpe cee"),
+    "Pyzel": ("pyzel", "pyze1", "pyze i", "pyzel surfboards"),
+    "Lost": ("lost", "...lost", "lost surfboards"),
+    "Byrne": ("byrne", "burne", "byrn"),
+    "T Patterson": ("t patterson", "tpatterson", "t patterson surfboards"),
+    "Stewart": ("stewart", "stewart surfboards", "stewart surf"),
+    "Rumaner": ("rumaner", "rum aner", "rumaner surfboards"),
+    "Album": ("album", "album surfboards"),
+}
+
+MODEL_ALIASES = {
+    "JS": {
+        "Monsta": ("monsta", "mor sta", "monsta box"),
+    },
+    "Pyzel": {
+        "The Bastard": ("the bastard", "bastard", "the bastrd", "bastrd"),
+    },
+    "Lost": {
+        "Driver 2": ("driver 2", "driver2", "driver z", "driver"),
+        "V3 Stealth": ("v3 stealth", "v3stealth", "v 3 stealth"),
+    },
+    "Rumaner": {
+        "Annihilator": ("annihilator", "annhilator", "annihilater"),
+    },
+    "T Patterson": {
+        "Blue Fin": ("blue fin", "bluefin", "blue fm"),
+    },
+    "Stewart": {
+        "Pigme": ("pigme", "pig me", "picme", "pigmee"),
+    },
+}
 
 
 def _texts(value: str | Iterable[str]) -> list[str]:
@@ -36,6 +74,104 @@ def normalize_ocr_text(text: str) -> str:
     # OCR often puts the digits on the next line after `SH-`.
     text = re.sub(r"(?i)\b(SH)\s*[-–—]?\s*\n\s*(\d)", r"\1-\2", text)
     return text
+
+
+def _identity_key(value: str) -> str:
+    """Make OCR text comparable without losing the original display value."""
+    return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
+
+
+def _best_alias(value: str, aliases: dict[str, tuple[str, ...]], threshold: float) -> tuple[str, float]:
+    key = _identity_key(value)
+    if not key:
+        return "", 0.0
+    best_name, best_score = "", 0.0
+    for canonical, options in aliases.items():
+        for option in (canonical, *options):
+            option_key = _identity_key(option)
+            if not option_key:
+                continue
+            score = 1.0 if key == option_key else SequenceMatcher(None, key, option_key).ratio()
+            if score > best_score:
+                best_name, best_score = canonical, score
+    return (best_name, best_score) if best_score >= threshold else ("", best_score)
+
+
+def normalize_identity_fields(identifier: dict[str, str]) -> tuple[dict[str, str], dict[str, dict[str, object]]]:
+    """Canonicalize known brand/model aliases while preserving uncertainty.
+
+    Returns the normalized identifier and field-level audit information. The
+    original OCR text remains available to callers; this function only changes
+    values that match the small known vocabulary above.
+    """
+    result = dict(identifier)
+    audit: dict[str, dict[str, object]] = {}
+    brand = str(identifier.get("brand", ""))
+    canonical_brand, brand_score = _best_alias(brand, BRAND_ALIASES, 0.82 if len(_identity_key(brand)) >= 5 else 0.93)
+    if canonical_brand:
+        result["brand"] = canonical_brand
+        audit["brand"] = {"raw": brand, "value": canonical_brand, "method": "known_alias", "similarity": round(brand_score, 3)}
+    model = str(identifier.get("model", ""))
+    model_aliases = MODEL_ALIASES.get(result.get("brand", ""), {})
+    if model and model_aliases:
+        canonical_model, model_score = _best_alias(model, model_aliases, 0.78 if len(_identity_key(model)) >= 5 else 0.90)
+        if canonical_model:
+            result["model"] = canonical_model
+            audit["model"] = {"raw": model, "value": canonical_model, "method": "brand_conditioned_alias", "similarity": round(model_score, 3)}
+    return result, audit
+
+
+def extract_known_identity_mentions(texts: str | Iterable[str]) -> dict[str, str]:
+    """Recover known logo/model mentions when OCR omitted field labels."""
+    readings = _texts(texts)
+    result: dict[str, str] = {}
+    active_brand = ""
+    for reading in readings:
+        for line in normalize_ocr_text(reading).splitlines():
+            words = re.findall(r"[A-Za-z0-9#'-]+", line)
+            for size in (3, 2, 1):
+                for start in range(max(0, len(words) - size + 1)):
+                    phrase = " ".join(words[start:start + size])
+                    brand, brand_score = _best_alias(phrase, BRAND_ALIASES, 0.86 if len(_identity_key(phrase)) >= 5 else 0.94)
+                    if brand and "brand" not in result:
+                        result["brand"] = brand
+                    if brand:
+                        active_brand = brand
+                    if brand:
+                        model_aliases = MODEL_ALIASES.get(brand, {})
+                        model, model_score = _best_alias(phrase, model_aliases, 0.84 if len(_identity_key(phrase)) >= 5 else 0.94)
+                        if model and "model" not in result:
+                            result["model"] = model
+                    elif active_brand and "model" not in result:
+                        model_aliases = MODEL_ALIASES.get(active_brand, {})
+                        model, model_score = _best_alias(phrase, model_aliases, 0.84 if len(_identity_key(phrase)) >= 5 else 0.94)
+                        if model:
+                            result["model"] = model
+    return result
+
+
+def ocr_quality(text: str, identifier: dict[str, str] | None = None) -> dict[str, object]:
+    """Classify OCR as usable, weak, junk, or empty.
+
+    Tesseract returning characters is not success. A board photo is usable
+    only when it yields a known identity mention, an explicit field/value, or
+    a SKU-like number. Everything else remains available as raw diagnostics
+    but cannot influence identity grouping.
+    """
+    value = normalize_ocr_text(text or "").strip()
+    if not value:
+        return {"status": "empty", "alnum": 0, "label_hits": 0, "known_fields": 0}
+    alnum = sum(char.isalnum() for char in value)
+    printable = sum(char.isalnum() or char.isspace() or char in "#:-_/.," for char in value)
+    label_hits = sum(bool(re.search(rf"\b{label}\b", value, re.I)) for label in ("ITEM", "BRAND", "MODEL", "BOARD", "FIN SYSTEM"))
+    known = dict(identifier or {})
+    known.update({key: val for key, val in extract_known_identity_mentions(value).items() if val})
+    sku = bool(re.search(r"\b(?:SH|ITEM|BOARD)?\s*[-#:]?\s*\d{4,6}\b", value, re.I))
+    if known or label_hits or sku:
+        return {"status": "usable", "alnum": alnum, "label_hits": label_hits, "known_fields": len(known), "sku_like": sku}
+    if alnum < 4 or printable / max(len(value), 1) < 0.45:
+        return {"status": "junk", "alnum": alnum, "label_hits": label_hits, "known_fields": 0, "sku_like": False}
+    return {"status": "weak", "alnum": alnum, "label_hits": label_hits, "known_fields": 0, "sku_like": False}
 
 
 def _clean_value(field: str, raw: str) -> str:
@@ -154,7 +290,11 @@ def extract_card_identifier(texts: str | Iterable[str]) -> dict[str, str]:
     fin_box_count = _extract_fin_box_count(readings)
     if fin_box_count:
         identifier["fin_box_count"] = fin_box_count
-    return identifier
+    mentions = extract_known_identity_mentions(readings)
+    for field, value in mentions.items():
+        identifier.setdefault(field, value)
+    normalized, _ = normalize_identity_fields(identifier)
+    return normalized
 
 
 def extract_card_identifier_with_confidence(texts: str | Iterable[str]) -> dict[str, dict[str, object]]:
@@ -168,6 +308,13 @@ def extract_card_identifier_with_confidence(texts: str | Iterable[str]) -> dict[
     """
     readings = _texts(texts)
     identifier = extract_card_identifier(readings)
+    raw_identifier: dict[str, str] = {}
+    for field in ("brand", "model", "fin_system", "fin_box_count", "fins_included"):
+        if field == "brand" or field == "model":
+            candidates = _field_candidates(readings, field)
+            if candidates:
+                raw_identifier[field] = _choose(candidates)
+    _, normalization_audit = normalize_identity_fields(raw_identifier)
     result: dict[str, dict[str, object]] = {}
     for field, value in identifier.items():
         key = value.casefold().strip()
@@ -189,4 +336,6 @@ def extract_card_identifier_with_confidence(texts: str | Iterable[str]) -> dict[
             "confidence": round(min(0.99, 0.45 + 0.15 * max(0, occurrences - 1)), 3),
             "passes": occurrences,
         }
+        if field in normalization_audit:
+            result[field]["normalization"] = normalization_audit[field]
     return result

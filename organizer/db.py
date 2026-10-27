@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 7
 
 
 SCHEMA = """
@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS photos (
   content_hash TEXT NOT NULL, capture_time TEXT, width INTEGER, height INTEGER, shot_type TEXT NOT NULL,
   original_prediction TEXT, human_correction TEXT, crop_x INTEGER, crop_y INTEGER, crop_w INTEGER, crop_h INTEGER,
   crop_padding REAL NOT NULL DEFAULT 0.10, review_status TEXT NOT NULL DEFAULT 'needs_review',
-  source_is_card INTEGER NOT NULL DEFAULT 0, ocr_text TEXT DEFAULT '', card_fins_included TEXT DEFAULT '', card_fin_system TEXT DEFAULT '', unique(source_path)
+  source_is_card INTEGER NOT NULL DEFAULT 0, ocr_text TEXT DEFAULT '', card_fins_included TEXT DEFAULT '', card_fin_system TEXT DEFAULT '', board_perimeter TEXT DEFAULT '', classification_snapshot TEXT DEFAULT '', unique(source_path)
 );
 CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS grouping_predictions (
@@ -140,6 +140,10 @@ def connect(db_path: Path) -> sqlite3.Connection:
         conn.execute("ALTER TABLE photos ADD COLUMN card_fins_included TEXT DEFAULT ''")
     if "card_fin_system" not in columns:
         conn.execute("ALTER TABLE photos ADD COLUMN card_fin_system TEXT DEFAULT ''")
+    if "board_perimeter" not in columns:
+        conn.execute("ALTER TABLE photos ADD COLUMN board_perimeter TEXT DEFAULT ''")
+    if "classification_snapshot" not in columns:
+        conn.execute("ALTER TABLE photos ADD COLUMN classification_snapshot TEXT DEFAULT ''")
     run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
     for name, definition in (("worker_pid", "INTEGER"), ("log_path", "TEXT DEFAULT ''"), ("last_heartbeat_at", "TEXT")):
         if name not in run_columns:
